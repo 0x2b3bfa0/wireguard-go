@@ -49,8 +49,11 @@ type Device struct {
 
 	staticIdentity struct {
 		sync.RWMutex
-		privateKey NoisePrivateKey
-		publicKey  NoisePublicKey
+		// key is the device's long-term identity. It is nil when no identity
+		// is configured, a softwareStaticKey for an in-memory private key, or a
+		// hardwareStaticKey for an offloaded one. See agent.go.
+		key       staticKey
+		publicKey NoisePublicKey
 	}
 
 	peers struct {
@@ -227,58 +230,21 @@ func (device *Device) IsUnderLoad() bool {
 }
 
 func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
-	// lock required resources
-
 	device.staticIdentity.Lock()
 	defer device.staticIdentity.Unlock()
 
-	if sk.Equals(device.staticIdentity.privateKey) {
+	// No-op if the key is unchanged. Compare public keys so we never read the
+	// stored private key here (and so a future hardware key compares cleanly).
+	if device.staticIdentity.key != nil &&
+		device.staticIdentity.publicKey.Equals(sk.publicKey()) {
 		return nil
 	}
 
-	device.peers.Lock()
-	defer device.peers.Unlock()
-
-	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
-		peer.handshake.mutex.RLock()
-		lockedPeers = append(lockedPeers, peer)
+	// A zero key clears the static identity; otherwise install it in software.
+	if sk.IsZero() {
+		return device.installStaticKeyLocked(nil)
 	}
-
-	// remove peers with matching public keys
-
-	publicKey := sk.publicKey()
-	for key, peer := range device.peers.keyMap {
-		if peer.handshake.remoteStatic.Equals(publicKey) {
-			peer.handshake.mutex.RUnlock()
-			removePeerLocked(device, peer, key)
-			peer.handshake.mutex.RLock()
-		}
-	}
-
-	// update key material
-
-	device.staticIdentity.privateKey = sk
-	device.staticIdentity.publicKey = publicKey
-	device.cookieChecker.Init(publicKey)
-
-	// do static-static DH pre-computations
-
-	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
-		handshake := &peer.handshake
-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
-		expiredPeers = append(expiredPeers, peer)
-	}
-
-	for _, peer := range lockedPeers {
-		peer.handshake.mutex.RUnlock()
-	}
-	for _, peer := range expiredPeers {
-		peer.ExpireCurrentKeypairs()
-	}
-
-	return nil
+	return device.installStaticKeyLocked(newSoftwareStaticKey(sk))
 }
 
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {

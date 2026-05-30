@@ -85,8 +85,12 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 
 		// serialize device related values
 
-		if !device.staticIdentity.privateKey.IsZero() {
-			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
+		// Only a software-held key can be exported; a hardware-backed key
+		// returns ok == false and is thus never serialized.
+		if key := device.staticIdentity.key; key != nil {
+			if sk, ok := key.privateKey(); ok {
+				keyf("private_key", (*[32]byte)(&sk))
+			}
 		}
 
 		if device.net.port != 0 {

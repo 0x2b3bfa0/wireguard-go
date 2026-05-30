@@ -57,17 +57,22 @@ func assertEqual(t *testing.T, a, b []byte) {
 }
 
 func TestNoiseHandshake(t *testing.T) {
-	dev1 := randDevice(t)
-	dev2 := randDevice(t)
+	testNoiseHandshake(t, randDevice(t), randDevice(t))
+}
 
+// testNoiseHandshake drives a full Noise handshake between two devices and
+// verifies the derived state matches on both sides. The devices' static keys
+// may be backed by either an in-memory private key or a StaticKeyAgent; this
+// helper reads only the cached public key, so it is agnostic to which.
+func testNoiseHandshake(t *testing.T, dev1, dev2 *Device) {
 	defer dev1.Close()
 	defer dev2.Close()
 
-	peer1, err := dev2.NewPeer(dev1.staticIdentity.privateKey.publicKey())
+	peer1, err := dev2.NewPeer(dev1.staticIdentity.publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer2, err := dev1.NewPeer(dev2.staticIdentity.privateKey.publicKey())
+	peer2, err := dev1.NewPeer(dev2.staticIdentity.publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}

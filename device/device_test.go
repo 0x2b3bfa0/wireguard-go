@@ -295,7 +295,8 @@ func TestConcurrencySafety(t *testing.T) {
 	// Change private keys concurrently with tunnel use.
 	t.Run("privateKey", func(t *testing.T) {
 		bad := uapiCfg("private_key", "7777777777777777777777777777777777777777777777777777777777777777")
-		good := uapiCfg("private_key", hex.EncodeToString(pair[0].dev.staticIdentity.privateKey[:]))
+		sk, _ := pair[0].dev.staticIdentity.key.privateKey()
+		good := uapiCfg("private_key", hex.EncodeToString(sk[:]))
 		// Set iters to a large number like 1000 to flush out data races quickly.
 		// Don't leave it large. That can cause logical races
 		// in which the handshake is interleaved with key changes
