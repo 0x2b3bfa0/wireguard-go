@@ -171,3 +171,63 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 		testNoiseHandshake(t, agentDevice(t), agentDevice(t))
 	})
 }
+
+// closableKeyAgent is a softwareKeyAgent that records Close calls, to verify
+// device-owned (URI-resolved) agents get cleaned up on replacement.
+type closableKeyAgent struct {
+	*softwareKeyAgent
+	closed *bool
+}
+
+func (a closableKeyAgent) Close() error {
+	*a.closed = true
+	return nil
+}
+
+// TestStaticKeyAgentURI exercises the scheme registry and the UAPI-facing
+// SetStaticKeyAgentURI path with a fake software-backed scheme.
+func TestStaticKeyAgentURI(t *testing.T) {
+	closed := false
+	var gotLocator string
+	RegisterStaticKeyAgentScheme("test", func(locator string) (StaticKeyAgent, error) {
+		gotLocator = locator
+		return closableKeyAgent{softwareKeyAgent: newSoftwareKeyAgent(t), closed: &closed}, nil
+	})
+
+	dev := newTestDevice(t)
+
+	// Unknown scheme is rejected.
+	if err := dev.SetStaticKeyAgentURI("nope:whatever"); err == nil {
+		t.Fatal("expected error for unknown scheme")
+	}
+	// Malformed URI is rejected.
+	if err := dev.SetStaticKeyAgentURI("noscheme"); err == nil {
+		t.Fatal("expected error for URI without scheme")
+	}
+
+	// Valid URI installs the agent and records the locator.
+	if err := dev.SetStaticKeyAgentURI("test:openpgp?slot=decrypt"); err != nil {
+		t.Fatalf("SetStaticKeyAgentURI: %v", err)
+	}
+	if gotLocator != "openpgp?slot=decrypt" {
+		t.Fatalf("locator = %q, want %q", gotLocator, "openpgp?slot=decrypt")
+	}
+	dev.staticIdentity.RLock()
+	configured := dev.staticConfigured()
+	uri := dev.staticIdentity.agentURI
+	dev.staticIdentity.RUnlock()
+	if !configured {
+		t.Fatal("device not configured after URI install")
+	}
+	if uri != "test:openpgp?slot=decrypt" {
+		t.Fatalf("agentURI = %q, want the full URI", uri)
+	}
+
+	// Replacing the identity closes the device-owned agent.
+	if err := dev.SetStaticKeyAgent(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !closed {
+		t.Fatal("device-owned agent was not closed on replacement")
+	}
+}

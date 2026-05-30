@@ -54,6 +54,10 @@ type Device struct {
 		// hardwareStaticKey for an offloaded one. See agent.go.
 		key       staticKey
 		publicKey NoisePublicKey
+		// agentURI, when non-empty, is the scheme:locator that a UAPI
+		// static_key_agent line resolved to. It is echoed back on UAPI get and
+		// marks the current agent as device-owned (closed on replacement).
+		agentURI string
 	}
 
 	peers struct {

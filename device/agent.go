@@ -13,6 +13,13 @@
 
 package device
 
+import (
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+)
+
 // staticKey is the device's long-term identity, abstracted over where the
 // private key lives. The static private key is used only for DH, so an
 // implementation need expose just that operation, the matching public key, and
@@ -107,7 +114,9 @@ func (device *Device) staticSharedSecret(pk NoisePublicKey) (ss [NoisePublicKeyS
 }
 
 // SetStaticKeyAgent installs a hardware-backed static identity, or removes the
-// static identity entirely when agent is nil.
+// static identity entirely when agent is nil. The caller retains ownership of
+// the agent (it is not closed by the device); for device-owned agents resolved
+// from a URI, use SetStaticKeyAgentURI.
 func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 	device.staticIdentity.Lock()
 	defer device.staticIdentity.Unlock()
@@ -116,6 +125,86 @@ func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 		return device.installStaticKeyLocked(nil)
 	}
 	return device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
+}
+
+// StaticKeyAgentConstructor builds a StaticKeyAgent from a locator string (the
+// part of a static_key_agent URI after the scheme). It is registered against a
+// scheme name with RegisterStaticKeyAgentScheme.
+type StaticKeyAgentConstructor func(locator string) (StaticKeyAgent, error)
+
+var (
+	agentSchemesMu sync.RWMutex
+	agentSchemes   = map[string]StaticKeyAgentConstructor{}
+)
+
+// RegisterStaticKeyAgentScheme registers a constructor for static_key_agent
+// URIs of the form "<scheme>:<locator>". This is how an embedding application
+// plugs in a hardware backend (e.g. a smartcard) without the device package
+// depending on it. Registering the same scheme twice overwrites the previous
+// constructor. Typically called from an init function or main.
+func RegisterStaticKeyAgentScheme(scheme string, ctor StaticKeyAgentConstructor) {
+	agentSchemesMu.Lock()
+	defer agentSchemesMu.Unlock()
+	agentSchemes[scheme] = ctor
+}
+
+func lookupStaticKeyAgentScheme(scheme string) (StaticKeyAgentConstructor, bool) {
+	agentSchemesMu.RLock()
+	defer agentSchemesMu.RUnlock()
+	ctor, ok := agentSchemes[scheme]
+	return ctor, ok
+}
+
+// ResolveStaticKeyAgentURI resolves a "<scheme>:<locator>" URI against the
+// registered agent schemes and constructs the agent, WITHOUT installing it. The
+// caller owns the returned agent (and must Close it if applicable). This allows
+// resolving/validating a startup identity before other setup (e.g. before
+// opening a TUN), so misconfiguration fails fast.
+func ResolveStaticKeyAgentURI(uri string) (StaticKeyAgent, error) {
+	scheme, locator, ok := strings.Cut(uri, ":")
+	if !ok || scheme == "" {
+		return nil, fmt.Errorf("invalid static_key_agent URI %q: want scheme:locator", uri)
+	}
+
+	ctor, ok := lookupStaticKeyAgentScheme(scheme)
+	if !ok {
+		return nil, fmt.Errorf("unknown static_key_agent scheme %q", scheme)
+	}
+
+	agent, err := ctor(locator)
+	if err != nil {
+		return nil, fmt.Errorf("static_key_agent %q: %w", scheme, err)
+	}
+	return agent, nil
+}
+
+// SetStaticKeyAgentURI resolves a "<scheme>:<locator>" URI against the
+// registered agent schemes, constructs the agent, and installs it as the static
+// identity. The resulting agent is device-owned: it is closed (if it implements
+// io.Closer) when the identity is later replaced or the device is closed. This
+// is the path used by the UAPI static_key_agent line.
+func (device *Device) SetStaticKeyAgentURI(uri string) error {
+	agent, err := ResolveStaticKeyAgentURI(uri)
+	if err != nil {
+		return err
+	}
+
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	if err := device.installStaticKeyLocked(hardwareStaticKey{agent: agent}); err != nil {
+		closeAgent(agent)
+		return err
+	}
+	device.staticIdentity.agentURI = uri
+	return nil
+}
+
+// closeAgent closes an agent that implements io.Closer; otherwise a no-op.
+func closeAgent(agent StaticKeyAgent) {
+	if c, ok := agent.(io.Closer); ok {
+		_ = c.Close()
+	}
 }
 
 // installStaticKeyLocked swaps in newKey (or nil to clear the identity) and
@@ -128,6 +217,14 @@ func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 func (device *Device) installStaticKeyLocked(newKey staticKey) error {
 	device.peers.Lock()
 	defer device.peers.Unlock()
+
+	// Close a previously device-owned (URI-resolved) agent before replacing it.
+	if device.staticIdentity.agentURI != "" {
+		if hw, ok := device.staticIdentity.key.(hardwareStaticKey); ok {
+			closeAgent(hw.agent)
+		}
+		device.staticIdentity.agentURI = ""
+	}
 
 	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
