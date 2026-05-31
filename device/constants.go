@@ -11,16 +11,28 @@ import (
 
 /* Specification constants */
 
+// NOTE: Timer constants customized for hardware-bound connectivity.
+// The static key lives on a YubiKey; the goal is that unplugging it drops the
+// link within a couple of seconds and it cannot be re-established without the
+// card. To that end the whole timer family is rescaled (not just two values —
+// they are interdependent, see receive.go:61 and the RekeyTimeout rate-limit in
+// send.go) to: proactive rekey at 500ms, hard keypair rejection at 2s.
+//
+// CONSEQUENCES:
+//   - NON-INTEROPERABLE with stock WireGuard: both peers must run this build
+//     with identical constants.
+//   - Aggressive: every rekey triggers a card DH (~85ms). Validate on the
+//     loopback rig that 500ms rekey is stable under card latency before trusting.
 const (
 	RekeyAfterMessages      = (1 << 60)
 	RejectAfterMessages     = (1 << 64) - (1 << 13) - 1
-	RekeyAfterTime          = time.Second * 120
-	RekeyAttemptTime        = time.Second * 90
-	RekeyTimeout            = time.Second * 5
-	MaxTimerHandshakes      = 90 / 5 /* RekeyAttemptTime / RekeyTimeout */
-	RekeyTimeoutJitterMaxMs = 334
-	RejectAfterTime         = time.Second * 180
-	KeepaliveTimeout        = time.Second * 10
+	RekeyAfterTime          = time.Millisecond * 500
+	RekeyAttemptTime        = time.Millisecond * 1600
+	RekeyTimeout            = time.Millisecond * 400
+	MaxTimerHandshakes      = 1600 / 400 /* RekeyAttemptTime / RekeyTimeout */
+	RekeyTimeoutJitterMaxMs = 100
+	RejectAfterTime         = time.Second * 2
+	KeepaliveTimeout        = time.Millisecond * 400
 	CookieRefreshTime       = time.Second * 120
 	HandshakeInitationRate  = time.Second / 50
 	PaddingMultiple         = 16
