@@ -235,20 +235,26 @@ func (device *Device) IsUnderLoad() bool {
 
 func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	device.staticIdentity.Lock()
-	defer device.staticIdentity.Unlock()
 
 	// No-op if the key is unchanged. Compare public keys so we never read the
 	// stored private key here (and so a future hardware key compares cleanly).
 	if device.staticIdentity.key != nil &&
 		device.staticIdentity.publicKey.Equals(sk.publicKey()) {
+		device.staticIdentity.Unlock()
 		return nil
 	}
 
 	// A zero key clears the static identity; otherwise install it in software.
-	if sk.IsZero() {
-		return device.installStaticKeyLocked(nil)
+	var newKey staticKey
+	if !sk.IsZero() {
+		newKey = newSoftwareStaticKey(sk)
 	}
-	return device.installStaticKeyLocked(newSoftwareStaticKey(sk))
+	displaced := device.installStaticKeyLocked(newKey)
+	device.staticIdentity.Unlock()
+
+	// Close the displaced device-owned agent after unlocking (its Close may block).
+	closeAgent(displaced)
+	return nil
 }
 
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
@@ -354,6 +360,15 @@ func (device *Device) Close() {
 	// Remove peers before closing queues,
 	// because peers assume that queues are active.
 	device.RemoveAllPeers()
+
+	// Clear the static identity so a device-owned (URI-resolved) agent is
+	// closed — otherwise its card watcher goroutine and hardware handle leak
+	// for the life of the process. installStaticKeyLocked hands the agent back
+	// for us to close after unlocking, since its Close may block.
+	device.staticIdentity.Lock()
+	displacedAgent := device.installStaticKeyLocked(nil)
+	device.staticIdentity.Unlock()
+	closeAgent(displacedAgent)
 
 	// We kept a reference to the encryption and decryption queues,
 	// in case we started any new peers that might write to them.

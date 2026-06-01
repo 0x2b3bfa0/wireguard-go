@@ -528,7 +528,15 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	)
 
 	ok := func() bool {
-		// lock handshake state
+		// Lock order: staticIdentity (outer) then handshake.mutex (inner), to
+		// match every other static-key call site (CreateMessageInitiation,
+		// ConsumeMessageInitiation, installStaticKeyLocked). The static DH below
+		// runs under staticIdentity.RLock and, for a hardware agent, blocks on
+		// the card (~tens of ms); acquiring handshake.mutex first here would be
+		// the reverse order and can deadlock against installStaticKeyLocked,
+		// which holds staticIdentity (write) and then takes handshake.mutex.
+		device.staticIdentity.RLock()
+		defer device.staticIdentity.RUnlock()
 
 		handshake.mutex.RLock()
 		defer handshake.mutex.RUnlock()
@@ -536,11 +544,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		if handshake.state != handshakeInitiationCreated {
 			return false
 		}
-
-		// lock private key for reading
-
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
 
 		// finish 3-way DH
 

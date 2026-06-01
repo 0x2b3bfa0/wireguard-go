@@ -13,6 +13,7 @@
 package device
 
 import (
+	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -229,5 +230,72 @@ func TestStaticKeyAgentURI(t *testing.T) {
 	}
 	if !closed {
 		t.Fatal("device-owned agent was not closed on replacement")
+	}
+}
+
+// TestRedactAgentURI verifies that secret locator params (pin, password, etc.)
+// are never retained or echoed in cleartext, while non-secret structure is kept.
+// This guards the UAPI get path against leaking a card PIN.
+func TestRedactAgentURI(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		// must NOT appear anywhere in the output (the secret values)
+		mustNotContain []string
+		// must appear (non-secret structure preserved)
+		mustContain []string
+	}{
+		{
+			name:           "pin redacted",
+			in:             "yubikey:openpgp?pin=123456&publickey=AAAA",
+			mustNotContain: []string{"123456"},
+			mustContain:    []string{"yubikey:", "openpgp", "publickey=AAAA", "REDACTED"},
+		},
+		{
+			name:           "multiple secrets redacted",
+			in:             "yubikey:openpgp?pin=999&password=hunter2&slot=9c",
+			mustNotContain: []string{"999", "hunter2"},
+			mustContain:    []string{"slot=9c", "REDACTED"},
+		},
+		{
+			name:           "no query is unchanged",
+			in:             "yubikey:openpgp",
+			mustNotContain: nil,
+			mustContain:    []string{"yubikey:openpgp"},
+		},
+		{
+			name:           "no secret params unchanged-ish",
+			in:             "yubikey:openpgp?slot=9c&publickey=BBBB",
+			mustNotContain: nil,
+			mustContain:    []string{"slot=9c", "publickey=BBBB"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactAgentURI(c.in)
+			for _, s := range c.mustNotContain {
+				if strings.Contains(got, s) {
+					t.Fatalf("redactAgentURI(%q) = %q, must NOT contain secret %q", c.in, got, s)
+				}
+			}
+			for _, s := range c.mustContain {
+				if !strings.Contains(got, s) {
+					t.Fatalf("redactAgentURI(%q) = %q, expected to contain %q", c.in, got, s)
+				}
+			}
+		})
+	}
+}
+
+// TestRedactAgentURI_malformedFailsSafe ensures an unparseable query never
+// leaks: the result must not contain a stray secret-looking value.
+func TestRedactAgentURI_malformedFailsSafe(t *testing.T) {
+	// A query that url.ParseQuery rejects (bare %) must fall back to scheme:applet?REDACTED.
+	got := redactAgentURI("yubikey:openpgp?pin=%ZZ")
+	if strings.Contains(got, "%ZZ") || strings.Contains(got, "pin=%") {
+		t.Fatalf("malformed query leaked: %q", got)
+	}
+	if !strings.Contains(got, "REDACTED") {
+		t.Fatalf("malformed query should fail safe to REDACTED, got %q", got)
 	}
 }

@@ -16,6 +16,7 @@ package device
 import (
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -118,13 +119,18 @@ func (device *Device) staticSharedSecret(pk NoisePublicKey) (ss [NoisePublicKeyS
 // the agent (it is not closed by the device); for device-owned agents resolved
 // from a URI, use SetStaticKeyAgentURI.
 func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
-	device.staticIdentity.Lock()
-	defer device.staticIdentity.Unlock()
-
-	if agent == nil {
-		return device.installStaticKeyLocked(nil)
+	var newKey staticKey
+	if agent != nil {
+		newKey = hardwareStaticKey{agent: agent}
 	}
-	return device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
+
+	device.staticIdentity.Lock()
+	displaced := device.installStaticKeyLocked(newKey)
+	device.staticIdentity.Unlock()
+
+	// Close the displaced device-owned agent after unlocking (its Close may block).
+	closeAgent(displaced)
+	return nil
 }
 
 // StaticKeyAgentConstructor builds a StaticKeyAgent from a locator string (the
@@ -190,14 +196,52 @@ func (device *Device) SetStaticKeyAgentURI(uri string) error {
 	}
 
 	device.staticIdentity.Lock()
-	defer device.staticIdentity.Unlock()
+	displaced := device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
+	// Store a REDACTED locator for UAPI get echo-back. The raw URI may carry
+	// secret query params (e.g. pin=) that must never be retained in memory or
+	// surfaced on get; redactAgentURI strips them. The redacted form is not
+	// round-trippable through set, which is correct for secret material (mirrors
+	// how a hardware private_key is simply omitted on get).
+	device.staticIdentity.agentURI = redactAgentURI(uri)
+	device.staticIdentity.Unlock()
 
-	if err := device.installStaticKeyLocked(hardwareStaticKey{agent: agent}); err != nil {
-		closeAgent(agent)
-		return err
-	}
-	device.staticIdentity.agentURI = uri
+	// Close the displaced device-owned agent after unlocking (its Close may block).
+	closeAgent(displaced)
 	return nil
+}
+
+// secretLocatorParams are query parameters whose values are secrets and must be
+// redacted before an agent URI is retained or echoed over UAPI.
+var secretLocatorParams = map[string]bool{
+	"pin":        true,
+	"password":   true,
+	"passphrase": true,
+	"secret":     true,
+}
+
+// redactAgentURI returns the URI with the values of known-secret query params
+// replaced by "REDACTED", leaving the scheme, path, and non-secret params intact
+// so the result is still a useful locator for diagnostics. If the locator can't
+// be parsed as a query, only the scheme is kept (fail safe — never leak).
+func redactAgentURI(uri string) string {
+	scheme, locator, ok := strings.Cut(uri, ":")
+	if !ok {
+		return uri
+	}
+	applet, query, hasQuery := strings.Cut(locator, "?")
+	if !hasQuery {
+		return uri // no query params, nothing secret to redact
+	}
+	vals, err := url.ParseQuery(query)
+	if err != nil {
+		return scheme + ":" + applet + "?REDACTED" // fail safe
+	}
+	for k := range vals {
+		if secretLocatorParams[strings.ToLower(k)] {
+			vals.Set(k, "REDACTED")
+		}
+	}
+	return scheme + ":" + applet + "?" + vals.Encode()
 }
 
 // closeAgent closes an agent that implements io.Closer; otherwise a no-op.
@@ -213,15 +257,22 @@ func closeAgent(agent StaticKeyAgent) {
 // one, recompute the cached static-static DH, and expire current keypairs so
 // fresh handshakes use the new identity.
 //
-// The caller must hold device.staticIdentity's write lock.
-func (device *Device) installStaticKeyLocked(newKey staticKey) error {
+// If the previous identity was a device-owned (URI-resolved) agent, it is
+// returned as displaced so the caller can Close it AFTER releasing the locks —
+// an agent's Close may block (it stops a card watcher and releases hardware),
+// and must not run under staticIdentity's write lock + peers lock or it would
+// freeze the whole device. Returns nil if there was nothing device-owned to close.
+//
+// The caller must hold device.staticIdentity's write lock, and must call
+// closeAgent on the returned value once unlocked.
+func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced StaticKeyAgent) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
-	// Close a previously device-owned (URI-resolved) agent before replacing it.
+	// Hand back a previously device-owned agent for the caller to close later.
 	if device.staticIdentity.agentURI != "" {
 		if hw, ok := device.staticIdentity.key.(hardwareStaticKey); ok {
-			closeAgent(hw.agent)
+			displaced = hw.agent
 		}
 		device.staticIdentity.agentURI = ""
 	}
@@ -269,5 +320,5 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) error {
 	for _, peer := range expiredPeers {
 		peer.ExpireCurrentKeypairs()
 	}
-	return nil
+	return displaced
 }

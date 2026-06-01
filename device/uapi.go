@@ -93,8 +93,9 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			}
 		}
 
-		// Echo the agent URI (locator) for an agent installed via UAPI. This
-		// carries no secret — only where the key is, not the key itself.
+		// Echo the agent locator for an agent installed via UAPI. agentURI is
+		// stored already-redacted (secret params like pin= replaced), so this
+		// does not leak the private key or its PIN — only where the key lives.
 		if device.staticIdentity.agentURI != "" {
 			sendf("static_key_agent=%s", device.staticIdentity.agentURI)
 		}
