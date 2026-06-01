@@ -18,6 +18,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
+	"golang.zx2c4.com/wireguard/keyagent"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -223,6 +224,11 @@ func main() {
 	}
 
 	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
+
+	// Enable out-of-process key agents: a UAPI static_key_agent=<socket> line is
+	// resolved by dialing that socket and speaking keyproto (see the keyagent
+	// package). This is wired explicitly — no global registry, no init() magic.
+	device.SetStaticKeyAgentResolver(keyagent.Resolve)
 
 	logger.Verbosef("Device started")
 

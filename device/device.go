@@ -54,10 +54,21 @@ type Device struct {
 		// hardwareStaticKey for an offloaded one. See agent.go.
 		key       staticKey
 		publicKey NoisePublicKey
-		// agentURI, when non-empty, is the scheme:locator that a UAPI
-		// static_key_agent line resolved to. It is echoed back on UAPI get and
-		// marks the current agent as device-owned (closed on replacement).
-		agentURI string
+		// agentResolver turns a static_key_agent locator into a StaticKeyAgent.
+		// Supplied by the embedding binary (see SetStaticKeyAgentResolver); nil
+		// means static_key_agent lines are rejected. The device itself knows
+		// nothing about how agents are reached.
+		agentResolver StaticKeyAgentResolver
+		// agentLocator, when non-empty, is the static_key_agent locator the
+		// current device-owned agent was resolved from. It is echoed back on UAPI
+		// get and marks the current agent as device-owned (closed on replacement).
+		// It carries no secret (the PIN/key live in the agent process).
+		agentLocator string
+		// expireStop stops the goroutine watching the current agent's removal
+		// channel (see RemovalNotifier). nil when no such watcher is running.
+		// Closed and cleared whenever the identity is swapped or the device is
+		// closed; guarded by staticIdentity's write lock.
+		expireStop chan struct{}
 	}
 
 	peers struct {

@@ -13,8 +13,8 @@
 package device
 
 import (
-	"strings"
 	"testing"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
@@ -173,6 +173,88 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 	})
 }
 
+// removableKeyAgent is a softwareKeyAgent that also implements RemovalNotifier,
+// so the device arms its keypair-expiry watcher. fire() simulates the backend
+// key becoming unavailable.
+type removableKeyAgent struct {
+	*softwareKeyAgent
+	removed chan struct{}
+}
+
+func newRemovableKeyAgent(t *testing.T) *removableKeyAgent {
+	return &removableKeyAgent{
+		softwareKeyAgent: newSoftwareKeyAgent(t),
+		removed:          make(chan struct{}, 1),
+	}
+}
+
+func (a *removableKeyAgent) Removed() <-chan struct{} { return a.removed }
+func (a *removableKeyAgent) fire()                    { a.removed <- struct{}{} }
+
+// TestRemovalNotifierExpiresKeypairs verifies that an installed agent's removal
+// event expires all peers' current keypairs (the fast-teardown path). It also
+// checks the watcher stops once the agent is displaced, so a stale agent can no
+// longer expire keypairs.
+func TestRemovalNotifierExpiresKeypairs(t *testing.T) {
+	dev := newTestDevice(t)
+	agent := newRemovableKeyAgent(t)
+	if err := dev.SetStaticKeyAgent(agent); err != nil {
+		t.Fatal(err)
+	}
+
+	// A peer with a live current keypair.
+	peerSK, _ := newPrivateKey()
+	peer, err := dev.NewPeer(peerSK.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp := &Keypair{}
+	peer.keypairs.Lock()
+	peer.keypairs.current = kp
+	peer.keypairs.Unlock()
+
+	if got := kp.sendNonce.Load(); got == RejectAfterMessages {
+		t.Fatal("precondition: keypair already expired")
+	}
+
+	// Fire removal; the watcher must expire the keypair (sendNonce maxed out).
+	agent.fire()
+	if !waitFor(func() bool { return kp.sendNonce.Load() == RejectAfterMessages }) {
+		t.Fatal("keypair was not expired after removal event")
+	}
+
+	// Displace the agent; its watcher must stop. A subsequent fire on the old
+	// channel must NOT expire a fresh keypair.
+	if err := dev.SetStaticKeyAgent(nil); err != nil {
+		t.Fatal(err)
+	}
+	kp2 := &Keypair{}
+	peer.keypairs.Lock()
+	peer.keypairs.current = kp2
+	peer.keypairs.Unlock()
+
+	select {
+	case agent.removed <- struct{}{}: // best-effort; channel is buffered
+	default:
+	}
+	// Give any (incorrectly still-running) watcher a chance to act.
+	time.Sleep(100 * time.Millisecond)
+	if kp2.sendNonce.Load() == RejectAfterMessages {
+		t.Fatal("displaced agent's watcher still expired keypairs")
+	}
+}
+
+// waitFor polls cond for up to ~2s.
+func waitFor(cond func() bool) bool {
+	for i := 0; i < 200; i++ {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
+}
+
 // closableKeyAgent is a softwareKeyAgent that records Close calls, to verify
 // device-owned (URI-resolved) agents get cleaned up on replacement.
 type closableKeyAgent struct {
@@ -185,43 +267,40 @@ func (a closableKeyAgent) Close() error {
 	return nil
 }
 
-// TestStaticKeyAgentURI exercises the scheme registry and the UAPI-facing
-// SetStaticKeyAgentURI path with a fake software-backed scheme.
-func TestStaticKeyAgentURI(t *testing.T) {
+// TestStaticKeyAgentLocator exercises the resolver hook and the UAPI-facing
+// SetStaticKeyAgentLocator path with a fake software-backed resolver.
+func TestStaticKeyAgentLocator(t *testing.T) {
+	dev := newTestDevice(t)
+
+	// With no resolver configured, a locator is rejected.
+	if err := dev.SetStaticKeyAgentLocator("/run/whatever.sock"); err == nil {
+		t.Fatal("expected error when no resolver is configured")
+	}
+
 	closed := false
 	var gotLocator string
-	RegisterStaticKeyAgentScheme("test", func(locator string) (StaticKeyAgent, error) {
+	dev.SetStaticKeyAgentResolver(func(locator string) (StaticKeyAgent, error) {
 		gotLocator = locator
 		return closableKeyAgent{softwareKeyAgent: newSoftwareKeyAgent(t), closed: &closed}, nil
 	})
 
-	dev := newTestDevice(t)
-
-	// Unknown scheme is rejected.
-	if err := dev.SetStaticKeyAgentURI("nope:whatever"); err == nil {
-		t.Fatal("expected error for unknown scheme")
+	// A locator resolves, installs the agent, and is recorded verbatim.
+	const locator = "/run/wg-keyagent.sock"
+	if err := dev.SetStaticKeyAgentLocator(locator); err != nil {
+		t.Fatalf("SetStaticKeyAgentLocator: %v", err)
 	}
-	// Malformed URI is rejected.
-	if err := dev.SetStaticKeyAgentURI("noscheme"); err == nil {
-		t.Fatal("expected error for URI without scheme")
-	}
-
-	// Valid URI installs the agent and records the locator.
-	if err := dev.SetStaticKeyAgentURI("test:openpgp?slot=decrypt"); err != nil {
-		t.Fatalf("SetStaticKeyAgentURI: %v", err)
-	}
-	if gotLocator != "openpgp?slot=decrypt" {
-		t.Fatalf("locator = %q, want %q", gotLocator, "openpgp?slot=decrypt")
+	if gotLocator != locator {
+		t.Fatalf("resolver got locator %q, want %q", gotLocator, locator)
 	}
 	dev.staticIdentity.RLock()
 	configured := dev.staticConfigured()
-	uri := dev.staticIdentity.agentURI
+	stored := dev.staticIdentity.agentLocator
 	dev.staticIdentity.RUnlock()
 	if !configured {
-		t.Fatal("device not configured after URI install")
+		t.Fatal("device not configured after locator install")
 	}
-	if uri != "test:openpgp?slot=decrypt" {
-		t.Fatalf("agentURI = %q, want the full URI", uri)
+	if stored != locator {
+		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, locator)
 	}
 
 	// Replacing the identity closes the device-owned agent.
@@ -230,72 +309,5 @@ func TestStaticKeyAgentURI(t *testing.T) {
 	}
 	if !closed {
 		t.Fatal("device-owned agent was not closed on replacement")
-	}
-}
-
-// TestRedactAgentURI verifies that secret locator params (pin, password, etc.)
-// are never retained or echoed in cleartext, while non-secret structure is kept.
-// This guards the UAPI get path against leaking a card PIN.
-func TestRedactAgentURI(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		// must NOT appear anywhere in the output (the secret values)
-		mustNotContain []string
-		// must appear (non-secret structure preserved)
-		mustContain []string
-	}{
-		{
-			name:           "pin redacted",
-			in:             "yubikey:openpgp?pin=123456&publickey=AAAA",
-			mustNotContain: []string{"123456"},
-			mustContain:    []string{"yubikey:", "openpgp", "publickey=AAAA", "REDACTED"},
-		},
-		{
-			name:           "multiple secrets redacted",
-			in:             "yubikey:openpgp?pin=999&password=hunter2&slot=9c",
-			mustNotContain: []string{"999", "hunter2"},
-			mustContain:    []string{"slot=9c", "REDACTED"},
-		},
-		{
-			name:           "no query is unchanged",
-			in:             "yubikey:openpgp",
-			mustNotContain: nil,
-			mustContain:    []string{"yubikey:openpgp"},
-		},
-		{
-			name:           "no secret params unchanged-ish",
-			in:             "yubikey:openpgp?slot=9c&publickey=BBBB",
-			mustNotContain: nil,
-			mustContain:    []string{"slot=9c", "publickey=BBBB"},
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := redactAgentURI(c.in)
-			for _, s := range c.mustNotContain {
-				if strings.Contains(got, s) {
-					t.Fatalf("redactAgentURI(%q) = %q, must NOT contain secret %q", c.in, got, s)
-				}
-			}
-			for _, s := range c.mustContain {
-				if !strings.Contains(got, s) {
-					t.Fatalf("redactAgentURI(%q) = %q, expected to contain %q", c.in, got, s)
-				}
-			}
-		})
-	}
-}
-
-// TestRedactAgentURI_malformedFailsSafe ensures an unparseable query never
-// leaks: the result must not contain a stray secret-looking value.
-func TestRedactAgentURI_malformedFailsSafe(t *testing.T) {
-	// A query that url.ParseQuery rejects (bare %) must fall back to scheme:applet?REDACTED.
-	got := redactAgentURI("yubikey:openpgp?pin=%ZZ")
-	if strings.Contains(got, "%ZZ") || strings.Contains(got, "pin=%") {
-		t.Fatalf("malformed query leaked: %q", got)
-	}
-	if !strings.Contains(got, "REDACTED") {
-		t.Fatalf("malformed query should fail safe to REDACTED, got %q", got)
 	}
 }

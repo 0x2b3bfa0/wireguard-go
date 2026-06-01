@@ -93,11 +93,12 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			}
 		}
 
-		// Echo the agent locator for an agent installed via UAPI. agentURI is
-		// stored already-redacted (secret params like pin= replaced), so this
-		// does not leak the private key or its PIN — only where the key lives.
-		if device.staticIdentity.agentURI != "" {
-			sendf("static_key_agent=%s", device.staticIdentity.agentURI)
+		// Echo the agent locator for an agent installed via UAPI. The locator
+		// carries no secret (just where to reach the agent), so echoing it
+		// verbatim leaks neither the private key nor its PIN — those live in the
+		// agent process.
+		if device.staticIdentity.agentLocator != "" {
+			sendf("static_key_agent=%s", device.staticIdentity.agentLocator)
 		}
 
 		if device.net.port != 0 {
@@ -218,7 +219,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 
 	case "static_key_agent":
 		device.log.Verbosef("UAPI: Installing static key agent")
-		if err := device.SetStaticKeyAgentURI(value); err != nil {
+		if err := device.SetStaticKeyAgentLocator(value); err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set static_key_agent: %w", err)
 		}
 
