@@ -13,10 +13,6 @@
 
 package device
 
-import (
-	"fmt"
-)
-
 // staticKey is the device's long-term identity, abstracted over where the
 // private key lives. The static private key is used only for DH, so an
 // implementation need expose just that operation, the matching public key, and
@@ -118,40 +114,17 @@ func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 	return nil
 }
 
-// StaticKeyAgentResolver turns a static_key_agent locator (the value of the UAPI
-// static_key_agent= line) into a StaticKeyAgent. wireguard-go knows nothing about
-// how agents are reached or what a locator means; the embedding binary supplies a
-// concrete resolver (e.g. keyagent.Resolve, which dials a Unix socket).
-type StaticKeyAgentResolver func(locator string) (StaticKeyAgent, error)
-
-// SetStaticKeyAgentResolver installs the resolver used by SetStaticKeyAgentLocator
-// (and thus the UAPI static_key_agent line). It is per-device, holds no global
-// state, and is typically set once during setup, before serving UAPI. Without a
-// resolver, a static_key_agent line is rejected.
-func (device *Device) SetStaticKeyAgentResolver(resolve StaticKeyAgentResolver) {
-	device.staticIdentity.Lock()
-	device.staticIdentity.agentResolver = resolve
-	device.staticIdentity.Unlock()
-}
-
-// SetStaticKeyAgentLocator resolves locator via the configured resolver and
-// installs the resulting agent as the static identity. This is the path used by
-// the UAPI static_key_agent line.
+// SetStaticKeyAgentLocator dials the out-of-process agent at locator (a Unix
+// socket path) and installs it as the static identity. This is the path used by
+// the UAPI static_key_agent line; see keyagent.go for the transport.
 //
 // The locator is retained verbatim for UAPI get echo-back: it carries no secret
 // (just where to reach the agent), so there is nothing to redact — the PIN and
 // key live entirely in the agent process.
 func (device *Device) SetStaticKeyAgentLocator(locator string) error {
-	device.staticIdentity.RLock()
-	resolve := device.staticIdentity.agentResolver
-	device.staticIdentity.RUnlock()
-	if resolve == nil {
-		return fmt.Errorf("no static_key_agent resolver configured")
-	}
-
-	agent, err := resolve(locator)
+	agent, err := dialAgent(locator)
 	if err != nil {
-		return fmt.Errorf("static_key_agent: %w", err)
+		return err
 	}
 
 	device.staticIdentity.Lock()

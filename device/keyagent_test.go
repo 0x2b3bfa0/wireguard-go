@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-package keyagent
+package device
 
 import (
 	"bufio"
@@ -13,8 +13,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"golang.zx2c4.com/wireguard/device"
 )
 
 // fakeAgent is a restartable software agent speaking the UAPI-style protocol,
@@ -101,7 +99,7 @@ func shortSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "s")
 }
 
-func newKey(t *testing.T) *ecdh.PrivateKey {
+func newAgentKey(t *testing.T) *ecdh.PrivateKey {
 	t.Helper()
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -110,22 +108,22 @@ func newKey(t *testing.T) *ecdh.PrivateKey {
 	return k
 }
 
-func TestResolveAndSharedSecret(t *testing.T) {
-	priv := newKey(t)
+func TestDialAgentAndSharedSecret(t *testing.T) {
+	priv := newAgentKey(t)
 	path := shortSocketPath(t)
 	agent := startFakeAgent(t, path, priv)
 	defer agent.stop()
 
-	a, err := Resolve(path)
+	a, err := dialAgent(path)
 	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+		t.Fatalf("dialAgent: %v", err)
 	}
-	if a.PublicKey() != device.NoisePublicKey(agent.pub) {
+	if a.PublicKey() != NoisePublicKey(agent.pub) {
 		t.Fatalf("PublicKey mismatch: %x vs %x", a.PublicKey(), agent.pub)
 	}
 
-	peerPriv := newKey(t)
-	var peer device.NoisePublicKey
+	peerPriv := newAgentKey(t)
+	var peer NoisePublicKey
 	copy(peer[:], peerPriv.PublicKey().Bytes())
 
 	got, err := a.SharedSecret(peer)
@@ -133,30 +131,30 @@ func TestResolveAndSharedSecret(t *testing.T) {
 		t.Fatalf("SharedSecret: %v", err)
 	}
 	want, _ := priv.ECDH(peerPriv.PublicKey())
-	if got != device.NoisePublicKey(want) {
+	if got != NoisePublicKey(want) {
 		t.Fatalf("shared secret mismatch: %x vs %x", got, want)
 	}
 }
 
-func TestResolveFailsWhenAgentAbsent(t *testing.T) {
-	if _, err := Resolve(shortSocketPath(t)); err == nil {
-		t.Fatal("expected Resolve to fail with no agent listening")
+func TestDialAgentFailsWhenAgentAbsent(t *testing.T) {
+	if _, err := dialAgent(shortSocketPath(t)); err == nil {
+		t.Fatal("expected dialAgent to fail with no agent listening")
 	}
 }
 
-// TestRecoversAfterAgentRestart proves the self-heal: because each call dials a
+// TestAgentRecoversAfterRestart proves the self-heal: because each call dials a
 // fresh connection, losing and restarting the agent needs no reconnect logic.
-func TestRecoversAfterAgentRestart(t *testing.T) {
-	priv := newKey(t)
+func TestAgentRecoversAfterRestart(t *testing.T) {
+	priv := newAgentKey(t)
 	path := shortSocketPath(t)
 	agent := startFakeAgent(t, path, priv)
 
-	a, err := Resolve(path)
+	a, err := dialAgent(path)
 	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+		t.Fatalf("dialAgent: %v", err)
 	}
-	peerPriv := newKey(t)
-	var peer device.NoisePublicKey
+	peerPriv := newAgentKey(t)
+	var peer NoisePublicKey
 	copy(peer[:], peerPriv.PublicKey().Bytes())
 
 	if _, err := a.SharedSecret(peer); err != nil {
@@ -173,7 +171,7 @@ func TestRecoversAfterAgentRestart(t *testing.T) {
 	agent2 := startFakeAgent(t, path, priv)
 	defer agent2.stop()
 	// Listener may take a moment to bind after the previous one closed.
-	var got device.NoisePublicKey
+	var got NoisePublicKey
 	for i := 0; i < 50; i++ {
 		if got, err = a.SharedSecret(peer); err == nil {
 			break
@@ -184,7 +182,7 @@ func TestRecoversAfterAgentRestart(t *testing.T) {
 		t.Fatalf("did not recover after restart: %v", err)
 	}
 	want, _ := priv.ECDH(peerPriv.PublicKey())
-	if got != device.NoisePublicKey(want) {
+	if got != NoisePublicKey(want) {
 		t.Fatalf("shared secret mismatch after restart")
 	}
 }

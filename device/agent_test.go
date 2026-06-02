@@ -6,8 +6,8 @@
  * That defeats the security purpose (hardware custody) but exercises exactly
  * the code path a hardware agent — e.g. a YubiKey OpenPGP cv25519 key — drives:
  * the device's static identity is a hardwareStaticKey, so every static-key DH
- * routes through StaticKeyAgent.SharedSecret instead of an in-memory private key. If a full
- * Noise handshake completes with the agent in place, the seam is correct.
+ * routes through StaticKeyAgent.SharedSecret instead of an in-memory private key.
+ * If a full Noise handshake completes with the agent in place, the seam is correct.
  */
 
 package device
@@ -172,39 +172,40 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 	})
 }
 
-// TestStaticKeyAgentLocator exercises the resolver hook and the UAPI-facing
-// SetStaticKeyAgentLocator path with a fake software-backed resolver.
+// TestStaticKeyAgentLocator exercises the UAPI-facing SetStaticKeyAgentLocator
+// path end to end: dial a real agent on a socket, install it, and echo-track the
+// locator.
 func TestStaticKeyAgentLocator(t *testing.T) {
 	dev := newTestDevice(t)
 
-	// With no resolver configured, a locator is rejected.
-	if err := dev.SetStaticKeyAgentLocator("/run/whatever.sock"); err == nil {
-		t.Fatal("expected error when no resolver is configured")
+	// A path with nothing listening fails fast.
+	if err := dev.SetStaticKeyAgentLocator(shortSocketPath(t)); err == nil {
+		t.Fatal("expected error dialing a nonexistent agent")
 	}
 
-	var gotLocator string
-	dev.SetStaticKeyAgentResolver(func(locator string) (StaticKeyAgent, error) {
-		gotLocator = locator
-		return newSoftwareKeyAgent(t), nil
-	})
+	// A real agent on a socket installs, with its public key, and the locator is
+	// recorded verbatim for UAPI get echo-back.
+	priv := newAgentKey(t)
+	path := shortSocketPath(t)
+	agent := startFakeAgent(t, path, priv)
+	defer agent.stop()
 
-	// A locator resolves, installs the agent, and is recorded verbatim.
-	const locator = "/run/wg-keyagent.sock"
-	if err := dev.SetStaticKeyAgentLocator(locator); err != nil {
+	if err := dev.SetStaticKeyAgentLocator(path); err != nil {
 		t.Fatalf("SetStaticKeyAgentLocator: %v", err)
-	}
-	if gotLocator != locator {
-		t.Fatalf("resolver got locator %q, want %q", gotLocator, locator)
 	}
 	dev.staticIdentity.RLock()
 	configured := dev.staticIdentity.key != nil
 	stored := dev.staticIdentity.agentLocator
+	pub := dev.staticIdentity.publicKey
 	dev.staticIdentity.RUnlock()
 	if !configured {
 		t.Fatal("device not configured after locator install")
 	}
-	if stored != locator {
-		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, locator)
+	if stored != path {
+		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, path)
+	}
+	if pub != NoisePublicKey(agent.pub) {
+		t.Fatalf("public key mismatch: %x vs %x", pub, agent.pub)
 	}
 
 	// Clearing the identity drops the agent locator (UAPI get no longer echoes it).

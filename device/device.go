@@ -54,15 +54,10 @@ type Device struct {
 		// hardwareStaticKey for an offloaded one. See agent.go.
 		key       staticKey
 		publicKey NoisePublicKey
-		// agentResolver turns a static_key_agent locator into a StaticKeyAgent.
-		// Supplied by the embedding binary (see SetStaticKeyAgentResolver); nil
-		// means static_key_agent lines are rejected. The device itself knows
-		// nothing about how agents are reached.
-		agentResolver StaticKeyAgentResolver
-		// agentLocator, when non-empty, is the static_key_agent locator the
-		// current device-owned agent was resolved from. It is echoed back on UAPI
-		// get and marks the current agent as device-owned (closed on replacement).
-		// It carries no secret (the PIN/key live in the agent process).
+		// agentLocator, when non-empty, is the static_key_agent locator (socket
+		// path) the current agent was dialed from. It is echoed back on UAPI get
+		// so the agent config round-trips. It carries no secret (the PIN/key live
+		// in the agent process).
 		agentLocator string
 	}
 
