@@ -7,228 +7,132 @@
  * smartcard). This is the privilege-separation boundary; the WireGuard process
  * never sees the PIN and cannot extract the key, only ask the agent to use it.
  *
- * It registers the "wgk" static_key_agent scheme. Point the device at an agent
- * over UAPI:
+ * Wire protocol — the WireGuard cross-platform UAPI convention itself
+ * (https://www.wireguard.com/xplatform/), reused rather than reinvented: one
+ * operation per connection, request and response are newline-terminated
+ * "key=value" lines ending in a blank line, keys are lowercase hex, and the
+ * response ends with "errno=0" on success (non-zero on failure). Two operations:
  *
- *     static_key_agent=wgk:/run/wg-keyagent.sock
- *     static_key_agent=wgk:/run/wg-keyagent.sock?publickey=<base64>
+ *     get=1\n\n                          -> public_key=<hex>\nerrno=0\n\n
+ *     shared_secret=1\npeer=<hex>\n\n    -> shared_secret=<hex>\nerrno=0\n\n
  *
- * The transport is keyproto (NDJSON + JSON-RPC 2.0), deliberately language-
- * agnostic so agents can be written in anything.
- *
- * The agent connection is SELF-HEALING. When the agent reports the key was
- * removed (its backend hardware was unplugged) or the connection drops, the
- * connAgent signals the device to expire all keypairs immediately (sub-second
- * teardown, via device.RemovalNotifier) and then re-dials the agent in the
- * background. Once the agent is back and holds the same key, DH works again and
- * WireGuard's own handshake timers rebuild the tunnel — no reconfiguration, no
- * supervisor on the WireGuard side. This keeps the runtime to exactly two
- * processes: wireguard-go and the agent.
+ * Each SharedSecret dials a fresh connection, exactly as `wg` does for each UAPI
+ * operation. That makes recovery automatic: if the agent (and its card) go away
+ * and come back, the next handshake's dial simply succeeds again — no persistent
+ * connection, no reconnect logic. While the agent is gone, SharedSecret errors,
+ * the handshake fails, and the link dies at RejectAfterTime; the key being
+ * physically necessary for connectivity is the whole point.
  */
 
 package keyagent
 
 import (
+	"bufio"
+	"encoding/hex"
 	"fmt"
-	"log"
 	"net"
-	"sync"
+	"strings"
 	"time"
 
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/keyproto"
 )
 
-const (
-	// dialTimeout bounds connecting to the agent socket. The agent is local, so
-	// a short timeout is plenty; a hang here would otherwise stall UAPI config.
-	dialTimeout = 5 * time.Second
-	// reconnectInterval paces background re-dial attempts after the agent goes
-	// away (its backend hardware removed, or the agent process restarting).
-	reconnectInterval = 1 * time.Second
-)
+// dialTimeout bounds connecting to the agent socket. The agent is local, so a
+// short timeout is plenty; a hang here would otherwise stall a handshake.
+const dialTimeout = 5 * time.Second
 
-type connAgent struct {
-	socketPath string
-	pub        device.NoisePublicKey
-
-	mu     sync.Mutex
-	client *keyproto.Client // current connection; nil while disconnected
-
-	removed chan struct{} // device watches this (RemovalNotifier); one send per loss
-	done    chan struct{} // closed by Close to stop the supervisor
-	closed  bool
-}
-
-// Resolve is a device.StaticKeyAgentResolver: it builds a self-healing agent
-// connection from a locator. The locator is simply the path to the agent's Unix
-// socket:
-//
-//	/run/wg-keyagent.sock
-//
-// It carries no secret — the PIN and the key live entirely in the agent
-// process. Wire it into wireguard-go with
-// device.SetStaticKeyAgentResolver(keyagent.Resolve); the UAPI line is then
-// static_key_agent=/run/wg-keyagent.sock.
-//
-// Identity is pinned the WireGuard-native way: peers list this device's public
-// key, so a wrong/absent key simply fails to handshake. The connection also
-// refuses any identity that changes across a reconnect (see dialAndInit), so a
-// swapped token is rejected rather than silently adopted.
+// Resolve is a device.StaticKeyAgentResolver. The locator is the path to the
+// agent's Unix socket; it carries no secret (the PIN and key live in the agent).
+// Wire it in with device.SetStaticKeyAgentResolver(keyagent.Resolve); the UAPI
+// line is then static_key_agent=/run/wg-keyagent.sock.
 func Resolve(locator string) (device.StaticKeyAgent, error) {
 	if locator == "" {
 		return nil, fmt.Errorf("keyagent: empty socket path")
 	}
-
-	a := &connAgent{
-		socketPath: locator,
-		removed:    make(chan struct{}, 1),
-		done:       make(chan struct{}),
-	}
-
-	// Initial connection is synchronous: fail fast if the agent isn't reachable,
-	// so a bad UAPI config is rejected immediately.
-	client, pub, err := a.dialAndInit()
+	a := &connAgent{socketPath: locator}
+	// Fetch the public key once, up front: this both caches the identity and
+	// fails fast if the agent is unreachable, so a bad UAPI config is rejected
+	// immediately.
+	pub, err := a.get()
 	if err != nil {
 		return nil, err
 	}
 	a.pub = pub
-	a.client = client
-
-	go a.supervise(client)
 	return a, nil
 }
 
-// dialAndInit opens a connection, runs initialize, and (on reconnect) verifies
-// the recovered identity equals the one we first saw.
-func (a *connAgent) dialAndInit() (*keyproto.Client, device.NoisePublicKey, error) {
-	var zero device.NoisePublicKey
+type connAgent struct {
+	socketPath string
+	pub        device.NoisePublicKey
+}
+
+// op runs one UAPI-style operation on a fresh connection: it sends reqLines
+// followed by a blank line, reads the "key=value" response up to the blank line,
+// and returns the parsed fields. A non-zero errno is turned into an error.
+func (a *connAgent) op(reqLines ...string) (map[string]string, error) {
 	conn, err := net.DialTimeout("unix", a.socketPath, dialTimeout)
 	if err != nil {
-		return nil, zero, fmt.Errorf("dial key agent at %s: %w", a.socketPath, err)
+		return nil, fmt.Errorf("keyagent: dial %s: %w", a.socketPath, err)
 	}
-	client := keyproto.NewClient(conn)
+	defer conn.Close()
 
-	// The agent already knows its own card + PIN; the locator carries no secret.
-	// The empty string is reserved for future multi-identity selection.
-	pubArr, err := client.Initialize("")
-	if err != nil {
-		client.Close()
-		return nil, zero, fmt.Errorf("initialize key agent: %w", err)
+	if _, err := conn.Write([]byte(strings.Join(reqLines, "\n") + "\n\n")); err != nil {
+		return nil, fmt.Errorf("keyagent: write: %w", err)
 	}
-	var pub device.NoisePublicKey
-	copy(pub[:], pubArr[:])
 
-	// On reconnect, a.pub is already set; the recovered identity must match it,
-	// so a different token swapped in while the agent restarted is refused.
-	var unset device.NoisePublicKey
-	if a.pub != unset && a.pub != pub {
-		client.Close()
-		return nil, zero, fmt.Errorf("agent public key changed across reconnect; refusing")
-	}
-	return client, pub, nil
-}
-
-// supervise watches the live connection; on loss it signals the device (fast
-// teardown) and re-dials until the agent returns or Close is called.
-func (a *connAgent) supervise(client *keyproto.Client) {
-	for {
-		select {
-		case <-a.done:
-			client.Close()
-			return
-		case <-client.Removed():
-			// Connection lost (removal notification or EOF).
+	resp := make(map[string]string)
+	sc := bufio.NewScanner(conn)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			break // blank line terminates the operation
 		}
-
-		a.setClient(nil)
-		a.notifyRemoved() // device expires keypairs now (sub-second teardown)
-		client.Close()
-
-		next := a.redial()
-		if next == nil {
-			return // Close was called during re-dial
-		}
-		a.setClient(next)
-		client = next
-		log.Printf("wgk: reconnected to key agent at %s", a.socketPath)
+		k, v, _ := strings.Cut(line, "=")
+		resp[k] = v
 	}
-}
-
-// redial retries dial+initialize at reconnectInterval until it succeeds or Close
-// is called (returns nil).
-func (a *connAgent) redial() *keyproto.Client {
-	for {
-		select {
-		case <-a.done:
-			return nil
-		case <-time.After(reconnectInterval):
-		}
-		client, _, err := a.dialAndInit()
-		if err != nil {
-			continue // agent not back yet (or wrong key); keep waiting
-		}
-		return client
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("keyagent: read: %w", err)
 	}
-}
-
-func (a *connAgent) setClient(c *keyproto.Client) {
-	a.mu.Lock()
-	a.client = c
-	a.mu.Unlock()
-}
-
-func (a *connAgent) getClient() *keyproto.Client {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.client
-}
-
-func (a *connAgent) notifyRemoved() {
-	select {
-	case a.removed <- struct{}{}:
-	default: // a removal is already pending; coalesce
+	if e := resp["errno"]; e != "" && e != "0" {
+		return nil, fmt.Errorf("keyagent: agent errno=%s %s", e, resp["errmsg"])
 	}
+	return resp, nil
 }
 
-// SharedSecret forwards X25519(static_priv, peer) to the agent. While
-// disconnected it errors, which fails the handshake — exactly the desired
-// behavior when the key is unavailable.
-func (a *connAgent) SharedSecret(peer device.NoisePublicKey) (device.NoisePublicKey, error) {
-	c := a.getClient()
-	if c == nil {
-		return device.NoisePublicKey{}, fmt.Errorf("wgk: key agent disconnected")
-	}
-	ss, err := c.SharedSecret([32]byte(peer))
+func (a *connAgent) get() (device.NoisePublicKey, error) {
+	resp, err := a.op("get=1")
 	if err != nil {
 		return device.NoisePublicKey{}, err
 	}
-	return device.NoisePublicKey(ss), nil
+	return decodeKey(resp["public_key"])
 }
 
-// PublicKey returns the static public key reported by the agent. It is stable
-// across reconnects (dialAndInit refuses an identity that changed).
+// SharedSecret asks the agent to compute X25519(static_priv, peer). A wrong or
+// absent key surfaces here as an error (or, if a different card is present, as a
+// shared secret that simply won't let peers handshake), so identity is pinned
+// the WireGuard-native way without any extra check.
+func (a *connAgent) SharedSecret(peer device.NoisePublicKey) (device.NoisePublicKey, error) {
+	resp, err := a.op("shared_secret=1", "peer="+hex.EncodeToString(peer[:]))
+	if err != nil {
+		return device.NoisePublicKey{}, err
+	}
+	return decodeKey(resp["shared_secret"])
+}
+
 func (a *connAgent) PublicKey() device.NoisePublicKey { return a.pub }
 
-// Removed implements device.RemovalNotifier: it fires once each time the agent
-// connection is lost, so the device can expire keypairs for fast teardown.
-func (a *connAgent) Removed() <-chan struct{} { return a.removed }
-
-// Close stops the supervisor and drops the connection. Idempotent.
-func (a *connAgent) Close() error {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return nil
+// decodeKey parses a lowercase-hex 32-byte key, as used by UAPI.
+func decodeKey(s string) (device.NoisePublicKey, error) {
+	var k device.NoisePublicKey
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return k, fmt.Errorf("keyagent: invalid hex key: %w", err)
 	}
-	a.closed = true
-	close(a.done)
-	a.mu.Unlock()
-	return nil
+	if len(b) != len(k) {
+		return k, fmt.Errorf("keyagent: key is %d bytes, want %d", len(b), len(k))
+	}
+	copy(k[:], b)
+	return k, nil
 }
 
-// Compile-time checks.
-var (
-	_ device.StaticKeyAgent  = (*connAgent)(nil)
-	_ device.RemovalNotifier = (*connAgent)(nil)
-)
+var _ device.StaticKeyAgent = (*connAgent)(nil)

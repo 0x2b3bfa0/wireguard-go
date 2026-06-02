@@ -3,98 +3,91 @@
 package keyagent
 
 import (
+	"bufio"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/hex"
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/keyproto"
 )
 
-// swHandler is a software keyproto.Handler doing real X25519, standing in for a
-// card-backed agent so the connAgent transport/self-heal can be tested without
-// hardware.
-type swHandler struct {
-	priv *ecdh.PrivateKey
-	pub  [32]byte
-}
-
-func newSWHandler(t *testing.T) *swHandler {
-	t.Helper()
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	h := &swHandler{priv: priv}
-	copy(h.pub[:], priv.PublicKey().Bytes())
-	return h
-}
-
-func (h *swHandler) Initialize(string) ([32]byte, error) { return h.pub, nil }
-
-func (h *swHandler) SharedSecret(peer [32]byte) ([32]byte, error) {
-	var out [32]byte
-	pk, err := ecdh.X25519().NewPublicKey(peer[:])
-	if err != nil {
-		return out, err
-	}
-	ss, err := h.priv.ECDH(pk)
-	if err != nil {
-		return out, err
-	}
-	copy(out[:], ss)
-	return out, nil
-}
-
-// fakeAgent is a restartable keyproto server bound to a fixed socket path.
+// fakeAgent is a restartable software agent speaking the UAPI-style protocol,
+// standing in for a card-backed agent so the transport can be tested without
+// hardware. It does real X25519, one operation per connection.
 type fakeAgent struct {
 	path string
-	h    keyproto.Handler
+	priv *ecdh.PrivateKey
+	pub  [32]byte
 	ln   net.Listener
-
-	mu    sync.Mutex
-	conns []net.Conn
 }
 
-func startFakeAgent(t *testing.T, path string, h keyproto.Handler) *fakeAgent {
+func startFakeAgent(t *testing.T, path string, priv *ecdh.PrivateKey) *fakeAgent {
 	t.Helper()
 	os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	f := &fakeAgent{path: path, h: h, ln: ln}
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			f.mu.Lock()
-			f.conns = append(f.conns, c)
-			f.mu.Unlock()
-			keyproto.Serve(c, h)
-		}
-	}()
+	f := &fakeAgent{path: path, priv: priv, ln: ln}
+	copy(f.pub[:], priv.PublicKey().Bytes())
+	go f.serve()
 	return f
 }
 
-// stop closes the listener and all live connections (simulating the agent dying
-// / the card being pulled, depending on the test).
-func (f *fakeAgent) stop() {
-	f.ln.Close()
-	f.mu.Lock()
-	for _, c := range f.conns {
-		c.Close()
+func (f *fakeAgent) serve() {
+	for {
+		conn, err := f.ln.Accept()
+		if err != nil {
+			return
+		}
+		go f.handle(conn)
 	}
-	f.conns = nil
-	f.mu.Unlock()
 }
+
+func (f *fakeAgent) handle(conn net.Conn) {
+	defer conn.Close()
+	req := map[string]string{}
+	sc := bufio.NewScanner(conn)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			break
+		}
+		k, v, _ := strings.Cut(line, "=")
+		req[k] = v
+	}
+	switch {
+	case req["get"] == "1":
+		conn.Write([]byte("public_key=" + hex.EncodeToString(f.pub[:]) + "\nerrno=0\n\n"))
+	case req["shared_secret"] == "1":
+		peer, err := hex.DecodeString(req["peer"])
+		if err != nil {
+			conn.Write([]byte("errno=1\nerrmsg=bad peer\n\n"))
+			return
+		}
+		pk, err := ecdh.X25519().NewPublicKey(peer)
+		if err != nil {
+			conn.Write([]byte("errno=1\nerrmsg=bad point\n\n"))
+			return
+		}
+		ss, err := f.priv.ECDH(pk)
+		if err != nil {
+			conn.Write([]byte("errno=1\nerrmsg=ecdh failed\n\n"))
+			return
+		}
+		conn.Write([]byte("shared_secret=" + hex.EncodeToString(ss) + "\nerrno=0\n\n"))
+	default:
+		conn.Write([]byte("errno=1\nerrmsg=unknown op\n\n"))
+	}
+}
+
+func (f *fakeAgent) stop() { f.ln.Close() }
 
 func shortSocketPath(t *testing.T) string {
 	t.Helper()
@@ -108,24 +101,30 @@ func shortSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "s")
 }
 
-func TestConnAgentSharedSecretMatchesSoftware(t *testing.T) {
-	h := newSWHandler(t)
+func newKey(t *testing.T) *ecdh.PrivateKey {
+	t.Helper()
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	return k
+}
+
+func TestResolveAndSharedSecret(t *testing.T) {
+	priv := newKey(t)
 	path := shortSocketPath(t)
-	agent := startFakeAgent(t, path, h)
+	agent := startFakeAgent(t, path, priv)
 	defer agent.stop()
 
 	a, err := Resolve(path)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	defer a.(*connAgent).Close()
-
-	if got := a.PublicKey(); got != device.NoisePublicKey(h.pub) {
-		t.Fatalf("PublicKey mismatch: got %x want %x", got, h.pub)
+	if a.PublicKey() != device.NoisePublicKey(agent.pub) {
+		t.Fatalf("PublicKey mismatch: %x vs %x", a.PublicKey(), agent.pub)
 	}
 
-	// A random peer key; the agent's result must equal a direct X25519.
-	peerPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	peerPriv := newKey(t)
 	var peer device.NoisePublicKey
 	copy(peer[:], peerPriv.PublicKey().Bytes())
 
@@ -133,62 +132,59 @@ func TestConnAgentSharedSecretMatchesSoftware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SharedSecret: %v", err)
 	}
-	want, err := h.SharedSecret([32]byte(peer))
-	if err != nil {
-		t.Fatalf("reference ECDH: %v", err)
-	}
+	want, _ := priv.ECDH(peerPriv.PublicKey())
 	if got != device.NoisePublicKey(want) {
-		t.Fatalf("shared secret mismatch: got %x want %x", got, want)
+		t.Fatalf("shared secret mismatch: %x vs %x", got, want)
 	}
 }
 
-func TestConnAgentSelfHeals(t *testing.T) {
-	h := newSWHandler(t)
+func TestResolveFailsWhenAgentAbsent(t *testing.T) {
+	if _, err := Resolve(shortSocketPath(t)); err == nil {
+		t.Fatal("expected Resolve to fail with no agent listening")
+	}
+}
+
+// TestRecoversAfterAgentRestart proves the self-heal: because each call dials a
+// fresh connection, losing and restarting the agent needs no reconnect logic.
+func TestRecoversAfterAgentRestart(t *testing.T) {
+	priv := newKey(t)
 	path := shortSocketPath(t)
-	agent := startFakeAgent(t, path, h)
+	agent := startFakeAgent(t, path, priv)
 
 	a, err := Resolve(path)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	ca := a.(*connAgent)
-	defer ca.Close()
-
-	peerPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	peerPriv := newKey(t)
 	var peer device.NoisePublicKey
 	copy(peer[:], peerPriv.PublicKey().Bytes())
 
 	if _, err := a.SharedSecret(peer); err != nil {
-		t.Fatalf("SharedSecret before removal: %v", err)
+		t.Fatalf("SharedSecret before restart: %v", err)
 	}
 
-	// Kill the agent: Removed() must fire (drives the device's fast teardown),
-	// and SharedSecret must then error.
+	// Agent goes away: SharedSecret must error.
 	agent.stop()
-	select {
-	case <-a.(*connAgent).Removed():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Removed did not fire after agent died")
-	}
 	if _, err := a.SharedSecret(peer); err == nil {
-		t.Fatal("expected SharedSecret to error while disconnected")
+		t.Fatal("expected error while agent is down")
 	}
 
-	// Bring the agent back on the same socket; the connAgent must reconnect on
-	// its own (redial interval ~1s) and resume serving.
-	agent2 := startFakeAgent(t, path, h)
+	// Same key comes back on the same socket: the next call just works.
+	agent2 := startFakeAgent(t, path, priv)
 	defer agent2.stop()
-
-	deadline := time.After(8 * time.Second)
-	for {
-		if _, err := a.SharedSecret(peer); err == nil {
-			break // reconnected
+	// Listener may take a moment to bind after the previous one closed.
+	var got device.NoisePublicKey
+	for i := 0; i < 50; i++ {
+		if got, err = a.SharedSecret(peer); err == nil {
+			break
 		}
-		select {
-		case <-deadline:
-			t.Fatal("connAgent did not self-heal after agent returned")
-		case <-time.After(200 * time.Millisecond):
-		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	_ = ca
+	if err != nil {
+		t.Fatalf("did not recover after restart: %v", err)
+	}
+	want, _ := priv.ECDH(peerPriv.PublicKey())
+	if got != device.NoisePublicKey(want) {
+		t.Fatalf("shared secret mismatch after restart")
+	}
 }

@@ -6,9 +6,9 @@
  * cryptographic primitive: the X25519 Diffie-Hellman of the Noise handshake.
  * The device therefore holds its static identity behind the staticKey
  * interface rather than as raw bytes, so the DH can be performed either in
- * software (the default) or by external hardware — e.g. a YubiKey OpenPGP
- * cv25519 key — that never discloses the private scalar. Ephemeral DH and the
- * symmetric transport keys are unaffected and stay in software.
+ * software (the default) or by an external agent — e.g. a smartcard or other
+ * hardware token — that never discloses the private scalar. Ephemeral DH and
+ * the symmetric transport keys are unaffected and stay in software.
  */
 
 package device
@@ -39,8 +39,7 @@ type staticKey interface {
 	privateKey() (NoisePrivateKey, bool)
 }
 
-// softwareStaticKey holds the static private key in process memory. This is the
-// default and behaves exactly as upstream wireguard-go did.
+// softwareStaticKey holds the static private key in process memory (the default).
 type softwareStaticKey struct {
 	priv NoisePrivateKey
 	pub  NoisePublicKey
@@ -68,26 +67,6 @@ type StaticKeyAgent interface {
 	PublicKey() NoisePublicKey
 }
 
-// RemovalNotifier is an optional interface a StaticKeyAgent may implement to get
-// sub-second teardown when its key becomes unavailable (e.g. a hardware token is
-// unplugged). While such an agent is installed, the device watches the returned
-// channel; each receive expires ALL current keypairs immediately, so the tunnel
-// stops within milliseconds rather than waiting out RejectAfterTime.
-//
-// The agent is NOT discarded on a removal event — only the keypairs are expired.
-// This lets a self-healing agent (one that reconnects to its backend in the
-// background) recover transparently: once it can compute DH again, WireGuard's
-// normal handshake timers rebuild the tunnel with no reconfiguration.
-//
-// Semantics of the channel: send (don't close) once per removal event; it may
-// fire repeatedly over the agent's installed lifetime (lose key, recover, lose
-// again). Closing it is also honored — treated as one final removal event after
-// which the device stops watching. The device stops watching when the agent is
-// displaced or the device is closed.
-type RemovalNotifier interface {
-	Removed() <-chan struct{}
-}
-
 // hardwareStaticKey adapts an external StaticKeyAgent to the internal staticKey
 // interface. The private key lives in the agent's hardware and is never
 // exportable.
@@ -110,13 +89,6 @@ func (k hardwareStaticKey) sharedSecret(peer NoisePublicKey) (ss [NoisePublicKey
 func (k hardwareStaticKey) publicKey() NoisePublicKey { return k.agent.PublicKey() }
 
 func (k hardwareStaticKey) privateKey() (NoisePrivateKey, bool) { return NoisePrivateKey{}, false }
-
-// staticConfigured reports whether a static identity is installed.
-//
-// The caller must hold device.staticIdentity's (R)Lock.
-func (device *Device) staticConfigured() bool {
-	return device.staticIdentity.key != nil
-}
 
 // staticSharedSecret performs the static-key X25519 DH via whatever staticKey
 // is installed (software or hardware). It returns errInvalidPublicKey if no
@@ -151,12 +123,9 @@ func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 }
 
 // StaticKeyAgentResolver turns a static_key_agent locator (the value of the UAPI
-// static_key_agent= line) into a StaticKeyAgent. wireguard-go knows nothing
-// about how agents are reached or what a locator means; the embedding binary
-// supplies a concrete resolver (e.g. keyagent.Resolve, which dials a Unix socket
-// and speaks keyproto). This single hook replaces what used to be a global
-// scheme registry — there is exactly one way the device reaches an external key
-// (an agent), so a registry of "schemes" was unnecessary indirection.
+// static_key_agent= line) into a StaticKeyAgent. wireguard-go knows nothing about
+// how agents are reached or what a locator means; the embedding binary supplies a
+// concrete resolver (e.g. keyagent.Resolve, which dials a Unix socket).
 type StaticKeyAgentResolver func(locator string) (StaticKeyAgent, error)
 
 // SetStaticKeyAgentResolver installs the resolver used by SetStaticKeyAgentLocator
@@ -175,10 +144,9 @@ func (device *Device) SetStaticKeyAgentResolver(resolve StaticKeyAgentResolver) 
 // later replaced or the device is closed. This is the path used by the UAPI
 // static_key_agent line.
 //
-// The locator is retained verbatim for UAPI get echo-back. Unlike the old
-// in-process design (whose locator could carry a card PIN), an agent locator
-// carries NO secret — just where to reach the agent — so there is nothing to
-// redact: the PIN and the key live entirely in the agent process.
+// The locator is retained verbatim for UAPI get echo-back: it carries no secret
+// (just where to reach the agent), so there is nothing to redact — the PIN and
+// key live entirely in the agent process.
 func (device *Device) SetStaticKeyAgentLocator(locator string) error {
 	device.staticIdentity.RLock()
 	resolve := device.staticIdentity.agentResolver
@@ -209,51 +177,17 @@ func closeAgent(agent StaticKeyAgent) {
 	}
 }
 
-// watchAgentRemoval expires all keypairs whenever the installed agent's
-// RemovalNotifier channel fires, until stop is closed (the agent was displaced
-// or the device closed). A closed removal channel is treated as one final event.
-func (device *Device) watchAgentRemoval(removed <-chan struct{}, stop <-chan struct{}) {
-	for {
-		select {
-		case <-stop:
-			return
-		case _, ok := <-removed:
-			device.expireAllKeypairs("static-key agent reported key removal")
-			if !ok {
-				return // channel closed: no further events possible
-			}
-		}
-	}
-}
-
-// expireAllKeypairs forces an immediate re-handshake on every peer by expiring
-// their current keypairs. With a hardware static key that is currently
-// unavailable, the re-handshake's static DH fails, so traffic stops until the
-// agent can compute DH again — the fast path of hardware-bound teardown.
-func (device *Device) expireAllKeypairs(reason string) {
-	device.log.Verbosef("Expiring all keypairs: %s", reason)
-	device.peers.RLock()
-	peers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
-		peers = append(peers, peer)
-	}
-	device.peers.RUnlock()
-	for _, peer := range peers {
-		peer.ExpireCurrentKeypairs()
-	}
-}
-
 // installStaticKeyLocked swaps in newKey (or nil to clear the identity) and
 // performs the per-peer bookkeeping shared by SetPrivateKey and
 // SetStaticKeyAgent: drop peers whose static public key collides with our new
 // one, recompute the cached static-static DH, and expire current keypairs so
 // fresh handshakes use the new identity.
 //
-// If the previous identity was a device-owned (URI-resolved) agent, it is
+// If the previous identity was a device-owned (locator-resolved) agent, it is
 // returned as displaced so the caller can Close it AFTER releasing the locks —
-// an agent's Close may block (it stops a card watcher and releases hardware),
-// and must not run under staticIdentity's write lock + peers lock or it would
-// freeze the whole device. Returns nil if there was nothing device-owned to close.
+// an agent's Close may block (it releases hardware/closes a socket), and must
+// not run under staticIdentity's write lock + peers lock or it would freeze the
+// whole device. Returns nil if there was nothing device-owned to close.
 //
 // The caller must hold device.staticIdentity's write lock, and must call
 // closeAgent on the returned value once unlocked.
@@ -261,29 +195,12 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced Static
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
-	// Stop the previous agent's removal watcher, if any. The identity is being
-	// replaced (or cleared), so its removal events are no longer relevant.
-	if device.staticIdentity.expireStop != nil {
-		close(device.staticIdentity.expireStop)
-		device.staticIdentity.expireStop = nil
-	}
-
 	// Hand back a previously device-owned agent for the caller to close later.
 	if device.staticIdentity.agentLocator != "" {
 		if hw, ok := device.staticIdentity.key.(hardwareStaticKey); ok {
 			displaced = hw.agent
 		}
 		device.staticIdentity.agentLocator = ""
-	}
-
-	// If the new identity is a hardware agent that reports removals, start a
-	// watcher that expires keypairs immediately on each event (fast teardown).
-	if hw, ok := newKey.(hardwareStaticKey); ok {
-		if rn, ok := hw.agent.(RemovalNotifier); ok {
-			stop := make(chan struct{})
-			device.staticIdentity.expireStop = stop
-			go device.watchAgentRemoval(rn.Removed(), stop)
-		}
 	}
 
 	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
@@ -311,8 +228,7 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced Static
 	device.staticIdentity.publicKey = publicKey
 	device.cookieChecker.Init(publicKey)
 
-	// do static-static DH pre-computations
-	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
+	// recompute the cached static-static DH for every peer under the new identity
 	for _, peer := range device.peers.keyMap {
 		handshake := &peer.handshake
 		if newKey != nil {
@@ -320,13 +236,14 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced Static
 		} else {
 			handshake.precomputedStaticStatic = [NoisePublicKeySize]byte{}
 		}
-		expiredPeers = append(expiredPeers, peer)
 	}
 
 	for _, peer := range lockedPeers {
 		peer.handshake.mutex.RUnlock()
 	}
-	for _, peer := range expiredPeers {
+	// expire keypairs only after releasing the handshake read locks
+	// (ExpireCurrentKeypairs takes the handshake write lock)
+	for _, peer := range device.peers.keyMap {
 		peer.ExpireCurrentKeypairs()
 	}
 	return displaced

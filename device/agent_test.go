@@ -14,7 +14,6 @@ package device
 
 import (
 	"testing"
-	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
@@ -131,7 +130,7 @@ func TestStaticConfigured(t *testing.T) {
 	device := newTestDevice(t)
 
 	device.staticIdentity.RLock()
-	configured := device.staticConfigured()
+	configured := device.staticIdentity.key != nil
 	device.staticIdentity.RUnlock()
 	if configured {
 		t.Fatal("fresh device reports configured")
@@ -141,7 +140,7 @@ func TestStaticConfigured(t *testing.T) {
 		t.Fatal(err)
 	}
 	device.staticIdentity.RLock()
-	configured = device.staticConfigured()
+	configured = device.staticIdentity.key != nil
 	device.staticIdentity.RUnlock()
 	if !configured {
 		t.Fatal("device with agent reports not configured")
@@ -151,7 +150,7 @@ func TestStaticConfigured(t *testing.T) {
 		t.Fatal(err)
 	}
 	device.staticIdentity.RLock()
-	configured = device.staticConfigured()
+	configured = device.staticIdentity.key != nil
 	device.staticIdentity.RUnlock()
 	if configured {
 		t.Fatal("device after agent removal reports configured")
@@ -171,88 +170,6 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 	t.Run("both-agent", func(t *testing.T) {
 		testNoiseHandshake(t, agentDevice(t), agentDevice(t))
 	})
-}
-
-// removableKeyAgent is a softwareKeyAgent that also implements RemovalNotifier,
-// so the device arms its keypair-expiry watcher. fire() simulates the backend
-// key becoming unavailable.
-type removableKeyAgent struct {
-	*softwareKeyAgent
-	removed chan struct{}
-}
-
-func newRemovableKeyAgent(t *testing.T) *removableKeyAgent {
-	return &removableKeyAgent{
-		softwareKeyAgent: newSoftwareKeyAgent(t),
-		removed:          make(chan struct{}, 1),
-	}
-}
-
-func (a *removableKeyAgent) Removed() <-chan struct{} { return a.removed }
-func (a *removableKeyAgent) fire()                    { a.removed <- struct{}{} }
-
-// TestRemovalNotifierExpiresKeypairs verifies that an installed agent's removal
-// event expires all peers' current keypairs (the fast-teardown path). It also
-// checks the watcher stops once the agent is displaced, so a stale agent can no
-// longer expire keypairs.
-func TestRemovalNotifierExpiresKeypairs(t *testing.T) {
-	dev := newTestDevice(t)
-	agent := newRemovableKeyAgent(t)
-	if err := dev.SetStaticKeyAgent(agent); err != nil {
-		t.Fatal(err)
-	}
-
-	// A peer with a live current keypair.
-	peerSK, _ := newPrivateKey()
-	peer, err := dev.NewPeer(peerSK.publicKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	kp := &Keypair{}
-	peer.keypairs.Lock()
-	peer.keypairs.current = kp
-	peer.keypairs.Unlock()
-
-	if got := kp.sendNonce.Load(); got == RejectAfterMessages {
-		t.Fatal("precondition: keypair already expired")
-	}
-
-	// Fire removal; the watcher must expire the keypair (sendNonce maxed out).
-	agent.fire()
-	if !waitFor(func() bool { return kp.sendNonce.Load() == RejectAfterMessages }) {
-		t.Fatal("keypair was not expired after removal event")
-	}
-
-	// Displace the agent; its watcher must stop. A subsequent fire on the old
-	// channel must NOT expire a fresh keypair.
-	if err := dev.SetStaticKeyAgent(nil); err != nil {
-		t.Fatal(err)
-	}
-	kp2 := &Keypair{}
-	peer.keypairs.Lock()
-	peer.keypairs.current = kp2
-	peer.keypairs.Unlock()
-
-	select {
-	case agent.removed <- struct{}{}: // best-effort; channel is buffered
-	default:
-	}
-	// Give any (incorrectly still-running) watcher a chance to act.
-	time.Sleep(100 * time.Millisecond)
-	if kp2.sendNonce.Load() == RejectAfterMessages {
-		t.Fatal("displaced agent's watcher still expired keypairs")
-	}
-}
-
-// waitFor polls cond for up to ~2s.
-func waitFor(cond func() bool) bool {
-	for i := 0; i < 200; i++ {
-		if cond() {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return cond()
 }
 
 // closableKeyAgent is a softwareKeyAgent that records Close calls, to verify
@@ -293,7 +210,7 @@ func TestStaticKeyAgentLocator(t *testing.T) {
 		t.Fatalf("resolver got locator %q, want %q", gotLocator, locator)
 	}
 	dev.staticIdentity.RLock()
-	configured := dev.staticConfigured()
+	configured := dev.staticIdentity.key != nil
 	stored := dev.staticIdentity.agentLocator
 	dev.staticIdentity.RUnlock()
 	if !configured {

@@ -64,11 +64,6 @@ type Device struct {
 		// get and marks the current agent as device-owned (closed on replacement).
 		// It carries no secret (the PIN/key live in the agent process).
 		agentLocator string
-		// expireStop stops the goroutine watching the current agent's removal
-		// channel (see RemovalNotifier). nil when no such watcher is running.
-		// Closed and cleared whenever the identity is swapped or the device is
-		// closed; guarded by staticIdentity's write lock.
-		expireStop chan struct{}
 	}
 
 	peers struct {
