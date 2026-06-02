@@ -532,7 +532,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		// match every other static-key call site (CreateMessageInitiation,
 		// ConsumeMessageInitiation, installStaticKeyLocked). The static DH below
 		// runs under staticIdentity.RLock and, for a hardware agent, blocks on
-		// the card (~tens of ms); acquiring handshake.mutex first here would be
+		// the external agent (tens of ms); acquiring handshake.mutex first would be
 		// the reverse order and can deadlock against installStaticKeyLocked,
 		// which holds staticIdentity (write) and then takes handshake.mutex.
 		device.staticIdentity.RLock()

@@ -15,7 +15,6 @@ package device
 
 import (
 	"fmt"
-	"io"
 )
 
 // staticKey is the device's long-term identity, abstracted over where the
@@ -104,9 +103,9 @@ func (device *Device) staticSharedSecret(pk NoisePublicKey) (ss [NoisePublicKeyS
 }
 
 // SetStaticKeyAgent installs a hardware-backed static identity, or removes the
-// static identity entirely when agent is nil. The caller retains ownership of
-// the agent (it is not closed by the device); for device-owned agents resolved
-// from a locator, use SetStaticKeyAgentLocator.
+// static identity entirely when agent is nil. The caller owns the agent's
+// lifetime; the device never closes it. To install an agent from a UAPI locator
+// string instead of an object, use SetStaticKeyAgentLocator.
 func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 	var newKey staticKey
 	if agent != nil {
@@ -114,11 +113,8 @@ func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
 	}
 
 	device.staticIdentity.Lock()
-	displaced := device.installStaticKeyLocked(newKey)
-	device.staticIdentity.Unlock()
-
-	// Close the displaced device-owned agent after unlocking (its Close may block).
-	closeAgent(displaced)
+	defer device.staticIdentity.Unlock()
+	device.installStaticKeyLocked(newKey)
 	return nil
 }
 
@@ -139,10 +135,8 @@ func (device *Device) SetStaticKeyAgentResolver(resolve StaticKeyAgentResolver) 
 }
 
 // SetStaticKeyAgentLocator resolves locator via the configured resolver and
-// installs the resulting agent as the static identity. The agent is
-// device-owned: it is closed (if it implements io.Closer) when the identity is
-// later replaced or the device is closed. This is the path used by the UAPI
-// static_key_agent line.
+// installs the resulting agent as the static identity. This is the path used by
+// the UAPI static_key_agent line.
 //
 // The locator is retained verbatim for UAPI get echo-back: it carries no secret
 // (just where to reach the agent), so there is nothing to redact — the PIN and
@@ -161,47 +155,25 @@ func (device *Device) SetStaticKeyAgentLocator(locator string) error {
 	}
 
 	device.staticIdentity.Lock()
-	displaced := device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
+	defer device.staticIdentity.Unlock()
+	device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
 	device.staticIdentity.agentLocator = locator
-	device.staticIdentity.Unlock()
-
-	// Close the displaced device-owned agent after unlocking (its Close may block).
-	closeAgent(displaced)
 	return nil
 }
 
-// closeAgent closes an agent that implements io.Closer; otherwise a no-op.
-func closeAgent(agent StaticKeyAgent) {
-	if c, ok := agent.(io.Closer); ok {
-		_ = c.Close()
-	}
-}
-
 // installStaticKeyLocked swaps in newKey (or nil to clear the identity) and
-// performs the per-peer bookkeeping shared by SetPrivateKey and
-// SetStaticKeyAgent: drop peers whose static public key collides with our new
-// one, recompute the cached static-static DH, and expire current keypairs so
-// fresh handshakes use the new identity.
+// performs the per-peer bookkeeping shared by SetPrivateKey, SetStaticKeyAgent,
+// and SetStaticKeyAgentLocator: drop peers whose static public key collides with
+// the new one, recompute the cached static-static DH, and expire current
+// keypairs so fresh handshakes use the new identity.
 //
-// If the previous identity was a device-owned (locator-resolved) agent, it is
-// returned as displaced so the caller can Close it AFTER releasing the locks —
-// an agent's Close may block (it releases hardware/closes a socket), and must
-// not run under staticIdentity's write lock + peers lock or it would freeze the
-// whole device. Returns nil if there was nothing device-owned to close.
-//
-// The caller must hold device.staticIdentity's write lock, and must call
-// closeAgent on the returned value once unlocked.
-func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced StaticKeyAgent) {
+// The caller must hold device.staticIdentity's write lock.
+func (device *Device) installStaticKeyLocked(newKey staticKey) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
-	// Hand back a previously device-owned agent for the caller to close later.
-	if device.staticIdentity.agentLocator != "" {
-		if hw, ok := device.staticIdentity.key.(hardwareStaticKey); ok {
-			displaced = hw.agent
-		}
-		device.staticIdentity.agentLocator = ""
-	}
+	// A new identity supersedes any agent locator from a previous install.
+	device.staticIdentity.agentLocator = ""
 
 	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
@@ -246,5 +218,4 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) (displaced Static
 	for _, peer := range device.peers.keyMap {
 		peer.ExpireCurrentKeypairs()
 	}
-	return displaced
 }

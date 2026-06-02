@@ -17,8 +17,8 @@
  *     shared_secret=1\npeer=<hex>\n\n    -> shared_secret=<hex>\nerrno=0\n\n
  *
  * Each SharedSecret dials a fresh connection, exactly as `wg` does for each UAPI
- * operation. That makes recovery automatic: if the agent (and its card) go away
- * and come back, the next handshake's dial simply succeeds again — no persistent
+ * operation. That makes recovery automatic: if the agent goes away and comes
+ * back, the next handshake's dial simply succeeds again — no persistent
  * connection, no reconnect logic. While the agent is gone, SharedSecret errors,
  * the handshake fails, and the link dies at RejectAfterTime; the key being
  * physically necessary for connectivity is the whole point.
@@ -108,9 +108,9 @@ func (a *connAgent) get() (device.NoisePublicKey, error) {
 }
 
 // SharedSecret asks the agent to compute X25519(static_priv, peer). A wrong or
-// absent key surfaces here as an error (or, if a different card is present, as a
-// shared secret that simply won't let peers handshake), so identity is pinned
-// the WireGuard-native way without any extra check.
+// absent key surfaces here as an error (or, if the agent now holds a different
+// key, as a shared secret that simply won't let peers handshake), so identity is
+// pinned the WireGuard-native way without any extra check.
 func (a *connAgent) SharedSecret(peer device.NoisePublicKey) (device.NoisePublicKey, error) {
 	resp, err := a.op("shared_secret=1", "peer="+hex.EncodeToString(peer[:]))
 	if err != nil {

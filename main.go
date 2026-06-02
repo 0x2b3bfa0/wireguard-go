@@ -226,8 +226,8 @@ func main() {
 	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 
 	// Enable out-of-process key agents: a UAPI static_key_agent=<socket> line is
-	// resolved by dialing that socket and speaking keyproto (see the keyagent
-	// package). This is wired explicitly — no global registry, no init() magic.
+	// resolved by dialing that socket and speaking the agent line protocol (see
+	// the keyagent package).
 	device.SetStaticKeyAgentResolver(keyagent.Resolve)
 
 	logger.Verbosef("Device started")

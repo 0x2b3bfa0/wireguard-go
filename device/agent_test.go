@@ -172,18 +172,6 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 	})
 }
 
-// closableKeyAgent is a softwareKeyAgent that records Close calls, to verify
-// device-owned (URI-resolved) agents get cleaned up on replacement.
-type closableKeyAgent struct {
-	*softwareKeyAgent
-	closed *bool
-}
-
-func (a closableKeyAgent) Close() error {
-	*a.closed = true
-	return nil
-}
-
 // TestStaticKeyAgentLocator exercises the resolver hook and the UAPI-facing
 // SetStaticKeyAgentLocator path with a fake software-backed resolver.
 func TestStaticKeyAgentLocator(t *testing.T) {
@@ -194,11 +182,10 @@ func TestStaticKeyAgentLocator(t *testing.T) {
 		t.Fatal("expected error when no resolver is configured")
 	}
 
-	closed := false
 	var gotLocator string
 	dev.SetStaticKeyAgentResolver(func(locator string) (StaticKeyAgent, error) {
 		gotLocator = locator
-		return closableKeyAgent{softwareKeyAgent: newSoftwareKeyAgent(t), closed: &closed}, nil
+		return newSoftwareKeyAgent(t), nil
 	})
 
 	// A locator resolves, installs the agent, and is recorded verbatim.
@@ -220,11 +207,14 @@ func TestStaticKeyAgentLocator(t *testing.T) {
 		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, locator)
 	}
 
-	// Replacing the identity closes the device-owned agent.
+	// Clearing the identity drops the agent locator (UAPI get no longer echoes it).
 	if err := dev.SetStaticKeyAgent(nil); err != nil {
 		t.Fatal(err)
 	}
-	if !closed {
-		t.Fatal("device-owned agent was not closed on replacement")
+	dev.staticIdentity.RLock()
+	stored = dev.staticIdentity.agentLocator
+	dev.staticIdentity.RUnlock()
+	if stored != "" {
+		t.Fatalf("agentLocator = %q after clear, want empty", stored)
 	}
 }
