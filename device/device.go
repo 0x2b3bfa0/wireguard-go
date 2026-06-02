@@ -49,10 +49,10 @@ type Device struct {
 
 	staticIdentity struct {
 		sync.RWMutex
-		// key is the device's long-term identity. It is nil when no identity
-		// is configured, a softwareStaticKey for an in-memory private key, or a
-		// hardwareStaticKey for an offloaded one. See agent.go.
-		key       staticKey
+		// key is the device's long-term identity: nil when none is configured, a
+		// softwareStaticKey for an in-memory private key, or an external agent
+		// for an offloaded one. See agent.go.
+		key       StaticKeyAgent
 		publicKey NoisePublicKey
 		// agentLocator, when non-empty, is the static_key_agent locator (socket
 		// path) the current agent was dialed from. It is echoed back on UAPI get
@@ -246,7 +246,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	}
 
 	// A zero key clears the static identity; otherwise install it in software.
-	var newKey staticKey
+	var newKey StaticKeyAgent
 	if !sk.IsZero() {
 		newKey = newSoftwareStaticKey(sk)
 	}

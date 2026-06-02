@@ -85,12 +85,10 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 
 		// serialize device related values
 
-		// Only a software-held key can be exported; a hardware-backed key
-		// returns ok == false and is thus never serialized.
-		if key := device.staticIdentity.key; key != nil {
-			if sk, ok := key.privateKey(); ok {
-				keyf("private_key", (*[32]byte)(&sk))
-			}
+		// Only a software-held key can be exported; an external agent is not a
+		// softwareStaticKey, so its key is never serialized.
+		if sw, ok := device.staticIdentity.key.(softwareStaticKey); ok {
+			keyf("private_key", (*[32]byte)(&sw.priv))
 		}
 
 		// Echo the agent locator for an agent installed via UAPI. The locator

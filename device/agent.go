@@ -4,37 +4,30 @@
  *
  * WireGuard's long-term ("static") private key participates in exactly one
  * cryptographic primitive: the X25519 Diffie-Hellman of the Noise handshake.
- * The device therefore holds its static identity behind the staticKey
+ * The device therefore holds its static identity behind the StaticKeyAgent
  * interface rather than as raw bytes, so the DH can be performed either in
- * software (the default) or by an external agent — e.g. a smartcard or other
- * hardware token — that never discloses the private scalar. Ephemeral DH and
- * the symmetric transport keys are unaffected and stay in software.
+ * software (the default) or by an external agent — e.g. one that holds the key
+ * on a smartcard or other hardware token — that never discloses the private
+ * scalar. Ephemeral DH and the symmetric transport keys stay in software.
  */
 
 package device
 
-// staticKey is the device's long-term identity, abstracted over where the
-// private key lives. The static private key is used only for DH, so an
-// implementation need expose just that operation, the matching public key, and
-// — when the key is held in software — a way to read the raw private bytes back
-// out. Hardware-backed implementations report themselves non-exportable.
-//
-// This is the package-internal abstraction; external callers supply hardware
-// via the exported StaticKeyAgent interface, adapted by hardwareStaticKey.
-type staticKey interface {
-	// sharedSecret returns X25519(static_priv, peer). It returns
-	// errInvalidPublicKey if the result is all-zero (an invalid peer point).
-	sharedSecret(peer NoisePublicKey) ([NoisePublicKeySize]byte, error)
-	// publicKey returns the static public key.
-	publicKey() NoisePublicKey
-	// privateKey returns the raw private key when it is held in software, with
-	// ok == true. Hardware-backed keys cannot disclose it and return ok ==
-	// false. The value (not pointer) form hands back a copy the caller owns,
-	// avoiding aliasing the stored secret.
-	privateKey() (NoisePrivateKey, bool)
+// StaticKeyAgent backs the device's static identity. An implementation need only
+// perform the static-key X25519 DH and expose the matching public key, never the
+// private scalar. The in-memory default is softwareStaticKey; an external caller
+// (e.g. an out-of-process agent) provides its own.
+type StaticKeyAgent interface {
+	// SharedSecret returns X25519(static_priv, peer).
+	SharedSecret(peer NoisePublicKey) (NoisePublicKey, error)
+	// PublicKey returns the static public key corresponding to static_priv.
+	PublicKey() NoisePublicKey
 }
 
-// softwareStaticKey holds the static private key in process memory (the default).
+// softwareStaticKey is the default StaticKeyAgent: it holds the static private
+// key in process memory. It is the only implementation whose key can be
+// serialized over UAPI — IpcGetOperation type-asserts to this concrete type, so
+// an external agent's key is never exportable.
 type softwareStaticKey struct {
 	priv NoisePrivateKey
 	pub  NoisePublicKey
@@ -44,73 +37,43 @@ func newSoftwareStaticKey(sk NoisePrivateKey) softwareStaticKey {
 	return softwareStaticKey{priv: sk, pub: sk.publicKey()}
 }
 
-func (k softwareStaticKey) sharedSecret(peer NoisePublicKey) ([NoisePublicKeySize]byte, error) {
-	return k.priv.sharedSecret(peer)
+func (k softwareStaticKey) SharedSecret(peer NoisePublicKey) (NoisePublicKey, error) {
+	ss, err := k.priv.sharedSecret(peer)
+	return NoisePublicKey(ss), err
 }
 
-func (k softwareStaticKey) publicKey() NoisePublicKey { return k.pub }
+func (k softwareStaticKey) PublicKey() NoisePublicKey { return k.pub }
 
-func (k softwareStaticKey) privateKey() (NoisePrivateKey, bool) { return k.priv, true }
-
-// StaticKeyAgent is the public contract a caller implements to back the device's
-// static key with hardware. The agent performs the static-key X25519 DH without
-// revealing the private key.
-type StaticKeyAgent interface {
-	// SharedSecret returns X25519(static_priv, peer).
-	SharedSecret(peer NoisePublicKey) (NoisePublicKey, error)
-	// PublicKey returns the static public key corresponding to static_priv.
-	PublicKey() NoisePublicKey
-}
-
-// hardwareStaticKey adapts an external StaticKeyAgent to the internal staticKey
-// interface. The private key lives in the agent's hardware and is never
-// exportable.
-type hardwareStaticKey struct {
-	agent StaticKeyAgent
-}
-
-func (k hardwareStaticKey) sharedSecret(peer NoisePublicKey) (ss [NoisePublicKeySize]byte, err error) {
-	out, err := k.agent.SharedSecret(peer)
-	if err != nil {
-		return ss, err
-	}
-	ss = [NoisePublicKeySize]byte(out)
-	if isZero(ss[:]) {
-		return ss, errInvalidPublicKey
-	}
-	return ss, nil
-}
-
-func (k hardwareStaticKey) publicKey() NoisePublicKey { return k.agent.PublicKey() }
-
-func (k hardwareStaticKey) privateKey() (NoisePrivateKey, bool) { return NoisePrivateKey{}, false }
-
-// staticSharedSecret performs the static-key X25519 DH via whatever staticKey
-// is installed (software or hardware). It returns errInvalidPublicKey if no
-// identity is configured.
+// staticSharedSecret performs the static-key X25519 DH via the installed agent.
+// It returns errInvalidPublicKey if no identity is configured, or if the DH
+// yields an all-zero result — the Noise rejection of an invalid peer point,
+// enforced here once for every agent (software or external).
 //
 // The caller must hold device.staticIdentity's (R)Lock.
-func (device *Device) staticSharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySize]byte, err error) {
-	key := device.staticIdentity.key
-	if key == nil {
-		return ss, errInvalidPublicKey
+func (device *Device) staticSharedSecret(pk NoisePublicKey) ([NoisePublicKeySize]byte, error) {
+	agent := device.staticIdentity.key
+	if agent == nil {
+		return [NoisePublicKeySize]byte{}, errInvalidPublicKey
 	}
-	return key.sharedSecret(pk)
+	ss, err := agent.SharedSecret(pk)
+	if err != nil {
+		return [NoisePublicKeySize]byte{}, err
+	}
+	out := [NoisePublicKeySize]byte(ss)
+	if isZero(out[:]) {
+		return out, errInvalidPublicKey
+	}
+	return out, nil
 }
 
-// SetStaticKeyAgent installs a hardware-backed static identity, or removes the
-// static identity entirely when agent is nil. The caller owns the agent's
-// lifetime; the device never closes it. To install an agent from a UAPI locator
-// string instead of an object, use SetStaticKeyAgentLocator.
+// SetStaticKeyAgent installs an external static identity, or removes the static
+// identity entirely when agent is nil. The caller owns the agent's lifetime; the
+// device never closes it. To install an agent from a UAPI locator string instead
+// of an object, use SetStaticKeyAgentLocator.
 func (device *Device) SetStaticKeyAgent(agent StaticKeyAgent) error {
-	var newKey staticKey
-	if agent != nil {
-		newKey = hardwareStaticKey{agent: agent}
-	}
-
 	device.staticIdentity.Lock()
 	defer device.staticIdentity.Unlock()
-	device.installStaticKeyLocked(newKey)
+	device.installStaticKeyLocked(agent)
 	return nil
 }
 
@@ -129,7 +92,7 @@ func (device *Device) SetStaticKeyAgentLocator(locator string) error {
 
 	device.staticIdentity.Lock()
 	defer device.staticIdentity.Unlock()
-	device.installStaticKeyLocked(hardwareStaticKey{agent: agent})
+	device.installStaticKeyLocked(agent)
 	device.staticIdentity.agentLocator = locator
 	return nil
 }
@@ -141,7 +104,7 @@ func (device *Device) SetStaticKeyAgentLocator(locator string) error {
 // keypairs so fresh handshakes use the new identity.
 //
 // The caller must hold device.staticIdentity's write lock.
-func (device *Device) installStaticKeyLocked(newKey staticKey) {
+func (device *Device) installStaticKeyLocked(newKey StaticKeyAgent) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
@@ -156,7 +119,7 @@ func (device *Device) installStaticKeyLocked(newKey staticKey) {
 
 	var publicKey NoisePublicKey
 	if newKey != nil {
-		publicKey = newKey.publicKey()
+		publicKey = newKey.PublicKey()
 
 		// remove peers with matching public keys
 		for key, peer := range device.peers.keyMap {

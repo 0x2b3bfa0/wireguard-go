@@ -5,7 +5,7 @@
  * These use a *software* StaticKeyAgent that holds the private key in memory.
  * That defeats the security purpose (hardware custody) but exercises exactly
  * the code path a hardware agent — e.g. a YubiKey OpenPGP cv25519 key — drives:
- * the device's static identity is a hardwareStaticKey, so every static-key DH
+ * the device's static identity is this external agent, so every static-key DH
  * routes through StaticKeyAgent.SharedSecret instead of an in-memory private key.
  * If a full Noise handshake completes with the agent in place, the seam is correct.
  */
@@ -95,7 +95,7 @@ func TestStaticKeyAgentEquivalence(t *testing.T) {
 	}
 }
 
-// TestExportableGuard verifies that a hardware-backed key is never exportable
+// TestExportableGuard verifies that an external agent's key is never exportable
 // (so UAPI get cannot leak it), while a software key is.
 func TestExportableGuard(t *testing.T) {
 	dev := newTestDevice(t)
@@ -108,9 +108,9 @@ func TestExportableGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev.staticIdentity.RLock()
-	got, ok := dev.staticIdentity.key.privateKey()
+	sw, ok := dev.staticIdentity.key.(softwareStaticKey)
 	dev.staticIdentity.RUnlock()
-	if !ok || !got.Equals(sk) {
+	if !ok || !sw.priv.Equals(sk) {
 		t.Fatalf("software key should be exportable and equal; ok=%v", ok)
 	}
 
@@ -118,10 +118,10 @@ func TestExportableGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev.staticIdentity.RLock()
-	_, ok = dev.staticIdentity.key.privateKey()
+	_, ok = dev.staticIdentity.key.(softwareStaticKey)
 	dev.staticIdentity.RUnlock()
 	if ok {
-		t.Fatal("hardware-backed key must not be exportable")
+		t.Fatal("external agent must not be exportable")
 	}
 }
 
