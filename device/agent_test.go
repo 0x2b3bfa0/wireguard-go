@@ -178,19 +178,28 @@ func TestNoiseHandshakeWithAgent(t *testing.T) {
 func TestStaticKeyAgentLocator(t *testing.T) {
 	dev := newTestDevice(t)
 
-	// A path with nothing listening fails fast.
+	// A locator without publickey= is rejected.
 	if err := dev.SetStaticKeyAgentLocator(shortSocketPath(t)); err == nil {
+		t.Fatal("expected error: locator without publickey=")
+	}
+
+	priv := newAgentKey(t)
+	var wantPub NoisePublicKey
+	copy(wantPub[:], priv.PublicKey().Bytes())
+	path := shortSocketPath(t)
+
+	// A valid publickey= but no agent listening fails fast.
+	if err := dev.SetStaticKeyAgentLocator(path + "?publickey=" + hexPub(priv)); err == nil {
 		t.Fatal("expected error dialing a nonexistent agent")
 	}
 
 	// A real agent on a socket installs, with its public key, and the locator is
 	// recorded verbatim for UAPI get echo-back.
-	priv := newAgentKey(t)
-	path := shortSocketPath(t)
 	agent := startFakeAgent(t, path, priv)
 	defer agent.stop()
 
-	if err := dev.SetStaticKeyAgentLocator(path); err != nil {
+	locator := path + "?publickey=" + hexPub(priv)
+	if err := dev.SetStaticKeyAgentLocator(locator); err != nil {
 		t.Fatalf("SetStaticKeyAgentLocator: %v", err)
 	}
 	dev.staticIdentity.RLock()
@@ -201,11 +210,11 @@ func TestStaticKeyAgentLocator(t *testing.T) {
 	if !configured {
 		t.Fatal("device not configured after locator install")
 	}
-	if stored != path {
-		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, path)
+	if stored != locator {
+		t.Fatalf("agentLocator = %q, want %q (verbatim, no redaction)", stored, locator)
 	}
-	if pub != NoisePublicKey(agent.pub) {
-		t.Fatalf("public key mismatch: %x vs %x", pub, agent.pub)
+	if pub != wantPub {
+		t.Fatalf("public key mismatch: %x vs %x", pub, wantPub)
 	}
 
 	// Clearing the identity drops the agent locator (UAPI get no longer echoes it).

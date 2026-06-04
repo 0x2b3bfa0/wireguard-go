@@ -6,18 +6,29 @@
  * a StaticKeyAgent that forwards the static-key X25519 DH to it — the ssh-agent
  * model: this process holds no key material and never sees the agent's PIN, it
  * only asks the agent to use the key. It is the resolver behind the UAPI
- * static_key_agent=<socket> line (see SetStaticKeyAgentLocator).
+ * static_key_agent=<locator> line (see SetStaticKeyAgentLocator).
+ *
+ * The locator is a Unix socket path with a required public-key selector:
+ *
+ *     /run/wg-keyagent.sock?publickey=<hex>
+ *
+ * The public key is the identity handle. It declares this interface's identity
+ * (the agent-mode analog of a private_key: the operator states which key is
+ * theirs, by its public half, since the private half is on the token) and tells
+ * the agent which token to use. The host confirms the agent holds it, then sends
+ * it as key= on every operation. It is required so the config fully declares the
+ * identity — like private_key, you never omit it and let the runtime guess.
  *
  * Wire protocol — the WireGuard cross-platform UAPI convention itself
  * (https://www.wireguard.com/xplatform/): one operation per connection, request
  * and response are newline-terminated "key=value" lines ending in a blank line,
  * keys are lowercase hex, and the response ends with "errno=0" (non-zero on
- * failure). Two operations:
+ * failure). Two operations, both naming the identity via key=:
  *
- *     get=1\n\n                       -> public_key=<hex>\nerrno=0\n\n
- *     shared_secret=1\npeer=<hex>\n\n -> shared_secret=<hex>\nerrno=0\n\n
+ *     get=1\nkey=<hex>\n\n                       -> public_key=<hex>\nerrno=0\n\n
+ *     shared_secret=1\nkey=<hex>\npeer=<hex>\n\n -> shared_secret=<hex>\nerrno=0\n\n
  *
- * Each SharedSecret dials a fresh connection, exactly as `wg` does for each UAPI
+ * Each operation dials a fresh connection, exactly as `wg` does for each UAPI
  * operation, so recovery is automatic: if the agent goes away and comes back,
  * the next handshake's dial simply succeeds again — no persistent connection, no
  * reconnect logic. While the agent is gone, SharedSecret errors, the handshake
@@ -32,6 +43,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -40,25 +52,56 @@ import (
 // a short timeout is plenty; a hang here would otherwise stall a handshake.
 const agentDialTimeout = 5 * time.Second
 
-// dialAgent resolves a static_key_agent locator (a Unix socket path) into a
-// StaticKeyAgent. It fetches the public key once, up front, which both caches
-// the identity and fails fast if the agent is unreachable.
-func dialAgent(socketPath string) (StaticKeyAgent, error) {
+// dialAgent resolves a static_key_agent locator into a StaticKeyAgent. The
+// locator must declare the interface's identity via publickey= (the agent-mode
+// analog of a private_key — the operator states which key is theirs by its
+// public half, since the private half is on the token). dialAgent then confirms,
+// via get, that the agent currently holds that key, so a wrong socket or absent
+// token fails at config time rather than silently never handshaking.
+func dialAgent(locator string) (StaticKeyAgent, error) {
+	socketPath, query, _ := strings.Cut(locator, "?")
 	if socketPath == "" {
 		return nil, fmt.Errorf("static_key_agent: empty socket path")
 	}
-	a := &connAgent{socketPath: socketPath}
-	pub, err := a.get()
+	vals, err := url.ParseQuery(query)
 	if err != nil {
+		return nil, fmt.Errorf("static_key_agent: bad locator query: %w", err)
+	}
+	hexPub := vals.Get("publickey")
+	if hexPub == "" {
+		return nil, fmt.Errorf("static_key_agent: publickey= is required (this interface's public key, in hex)")
+	}
+
+	a := &connAgent{socketPath: socketPath}
+	if err := a.pub.FromHex(hexPub); err != nil {
+		return nil, fmt.Errorf("static_key_agent: bad publickey: %w", err)
+	}
+	if err := a.confirm(); err != nil {
 		return nil, err
 	}
-	a.pub = pub
 	return a, nil
+}
+
+// confirm asks the agent for our key and checks it answers with the same key,
+// proving the token is present and reachable.
+func (a *connAgent) confirm() error {
+	resp, err := a.op("get=1", "key="+hex.EncodeToString(a.pub[:]))
+	if err != nil {
+		return err
+	}
+	var got NoisePublicKey
+	if err := got.FromHex(resp["public_key"]); err != nil {
+		return fmt.Errorf("static_key_agent: bad public_key from agent: %w", err)
+	}
+	if got != a.pub {
+		return fmt.Errorf("static_key_agent: agent returned a different key than requested")
+	}
+	return nil
 }
 
 type connAgent struct {
 	socketPath string
-	pub        NoisePublicKey
+	pub        NoisePublicKey // our identity, also the key= selector we send
 }
 
 // op runs one operation on a fresh connection: send reqLines + a blank line,
@@ -94,24 +137,13 @@ func (a *connAgent) op(reqLines ...string) (map[string]string, error) {
 	return resp, nil
 }
 
-func (a *connAgent) get() (NoisePublicKey, error) {
-	resp, err := a.op("get=1")
-	if err != nil {
-		return NoisePublicKey{}, err
-	}
-	var pub NoisePublicKey
-	if err := pub.FromHex(resp["public_key"]); err != nil {
-		return NoisePublicKey{}, fmt.Errorf("static_key_agent: bad public_key: %w", err)
-	}
-	return pub, nil
-}
-
-// SharedSecret asks the agent to compute X25519(static_priv, peer). A wrong or
-// absent key surfaces here as an error (or, if the agent now holds a different
-// key, as a shared secret that simply won't let peers handshake), so identity is
-// pinned the WireGuard-native way without any extra check.
+// SharedSecret asks the agent to compute X25519(static_priv, peer) with our key.
 func (a *connAgent) SharedSecret(peer NoisePublicKey) (NoisePublicKey, error) {
-	resp, err := a.op("shared_secret=1", "peer="+hex.EncodeToString(peer[:]))
+	resp, err := a.op(
+		"shared_secret=1",
+		"key="+hex.EncodeToString(a.pub[:]),
+		"peer="+hex.EncodeToString(peer[:]),
+	)
 	if err != nil {
 		return NoisePublicKey{}, err
 	}
